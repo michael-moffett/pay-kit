@@ -451,26 +451,27 @@ test('#10 createCredential rejects a network that does not match expectedNetwork
 // Every scenario in the file runs. There is no slice to select and no scenario
 // to skip.
 //
-// WHAT THIS ASSERTS, PRECISELY. This package has no RFC 3339 parser module.
-// The two expiry call sites delegate the whole parse to the JS engine:
+// WHAT THIS ASSERTS, PRECISELY. The verdict source is `parseRfc3339`, the
+// package's own parser. Both expiry call sites delegate their whole parse to it:
 //
 //   client/Charge.ts:404   assertChallengeNotExpired
-//                            -> new Date(expires).getTime(); NaN => "malformed"
-//   server/Session.ts:347  assertChallengeOpenNotExpired
-//                            -> Date.parse(expires);          NaN => "must be an RFC3339 timestamp"
+//   server/Session.ts:358  assertChallengeOpenNotExpired
 //
 // Both guards are module-private and neither package exposes a public surface
-// that returns a parse verdict, so this test evaluates the same two engine
-// expressions those call sites evaluate. The verdict source is therefore the
-// *delegated* parser (the engine), not an SDK-owned parser — a real
-// distinction, and the reason `expires` conformance here is a property of the
-// Node/V8 version as much as of this SDK. If a parser is ever exported, repoint
-// `verdicts` at it and the vectors carry over unchanged.
+// that returns a parse verdict, so the corpus is asserted against the parser
+// those two consume rather than against either guard. Evaluating an engine
+// expression here instead would report the Node/V8 version's conformance and
+// stay green whether or not this SDK was ever fixed.
 //
-// Both call sites are checked, because they are two different expressions and a
-// divergence between them would itself be a client/server protocol bug.
+// `shared/rfc3339.ts` arrives with #286; until that lands this file has nothing
+// to import and does not typecheck, which is the intended failure.
+//
+// Both call sites are checked, because a divergence between them would itself
+// be a client/server protocol bug.
 
 import { readFileSync } from 'node:fs';
+
+import { parseRfc3339 } from '../shared/rfc3339.js';
 
 interface ConformanceScenario {
     name: string;
@@ -500,23 +501,23 @@ test('every RFC 3339 corpus scenario is exercised', () => {
 for (const scenario of vectors) {
     test(`RFC 3339 corpus / charge call site / ${scenario.name}`, () => {
         // client/Charge.ts:404
-        const accepted = !Number.isNaN(new Date(scenario.input).getTime());
+        const accepted = !Number.isNaN(parseRfc3339(scenario.input));
         expect(
             accepted,
             `${scenario.name} (${scenario.description}): input ${JSON.stringify(scenario.input)} — ` +
                 `corpus expects ${expectsAccept(scenario) ? 'ACCEPT' : 'REJECT'}, ` +
-                `new Date(...).getTime() reports ${accepted ? 'ACCEPT' : 'REJECT'}`,
+                `parseRfc3339(...) reports ${accepted ? 'ACCEPT' : 'REJECT'}`,
         ).toBe(expectsAccept(scenario));
     });
 
     test(`RFC 3339 corpus / session call site / ${scenario.name}`, () => {
-        // server/Session.ts:347
-        const accepted = !Number.isNaN(Date.parse(scenario.input));
+        // server/Session.ts:358
+        const accepted = !Number.isNaN(parseRfc3339(scenario.input));
         expect(
             accepted,
             `${scenario.name} (${scenario.description}): input ${JSON.stringify(scenario.input)} — ` +
                 `corpus expects ${expectsAccept(scenario) ? 'ACCEPT' : 'REJECT'}, ` +
-                `Date.parse(...) reports ${accepted ? 'ACCEPT' : 'REJECT'}`,
+                `parseRfc3339(...) reports ${accepted ? 'ACCEPT' : 'REJECT'}`,
         ).toBe(expectsAccept(scenario));
     });
 }
