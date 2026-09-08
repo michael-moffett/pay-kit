@@ -441,33 +441,8 @@ test('#10 createCredential rejects a network that does not match expectedNetwork
     await expect(method.createCredential({ challenge })).rejects.toThrow(/does not match the expected network/);
 });
 
-// ── Cross-SDK RFC 3339 conformance corpus (issue #111) ──
-//
-// Vectors live in `harness/vectors/mpp-protocol/expires.json` under the
-// `expires.parse` operation. Every SDK asserts the same ACCEPT / REJECT verdict
-// against the same vectors, so a divergence between two SDKs shows up as a
-// failing test in exactly one of them rather than as silence.
-//
-// Every scenario in the file runs. There is no slice to select and no scenario
-// to skip.
-//
-// WHAT THIS ASSERTS, PRECISELY. The verdict source is `parseRfc3339`, the
-// package's own parser. Both expiry call sites delegate their whole parse to it:
-//
-//   client/Charge.ts:404   assertChallengeNotExpired
-//   server/Session.ts:358  assertChallengeOpenNotExpired
-//
-// Both guards are module-private and neither package exposes a public surface
-// that returns a parse verdict, so the corpus is asserted against the parser
-// those two consume rather than against either guard. Evaluating an engine
-// expression here instead would report the Node/V8 version's conformance and
-// stay green whether or not this SDK was ever fixed.
-//
-// `shared/rfc3339.ts` arrives with #286; until that lands this file has nothing
-// to import and does not typecheck, which is the intended failure.
-//
-// Both call sites are checked, because a divergence between them would itself
-// be a client/server protocol bug.
+// Cross-SDK RFC 3339 conformance corpus (issue #111).
+// Vectors: harness/vectors/mpp-protocol/expires.json, operation `expires.parse`.
 
 import { readFileSync } from 'node:fs';
 
@@ -485,33 +460,15 @@ const CORPUS_URL = new URL('../../../../../harness/vectors/mpp-protocol/expires.
 const corpus = JSON.parse(readFileSync(CORPUS_URL, 'utf8')) as { scenarios: ConformanceScenario[] };
 const vectors = corpus.scenarios;
 
-// `"tests": {"parse": true}` is ACCEPT; `{"parse": {"success": false, …}}` is
-// REJECT. Identical to the encoding the other vector files in the same
-// directory use.
 const expectsAccept = (scenario: ConformanceScenario) => scenario.tests.parse === true;
 
-// Guard the loader so a regression in it cannot go silent: every scenario in
-// the file is exercised, and a truncated or empty read fails here rather than
-// passing quietly with nothing to run.
 test('every RFC 3339 corpus scenario is exercised', () => {
     expect(vectors.length).toBe(corpus.scenarios.length);
     expect(vectors.length).toBeGreaterThan(0);
 });
 
 for (const scenario of vectors) {
-    test(`RFC 3339 corpus / charge call site / ${scenario.name}`, () => {
-        // client/Charge.ts:404
-        const accepted = !Number.isNaN(parseRfc3339(scenario.input));
-        expect(
-            accepted,
-            `${scenario.name} (${scenario.description}): input ${JSON.stringify(scenario.input)} — ` +
-                `corpus expects ${expectsAccept(scenario) ? 'ACCEPT' : 'REJECT'}, ` +
-                `parseRfc3339(...) reports ${accepted ? 'ACCEPT' : 'REJECT'}`,
-        ).toBe(expectsAccept(scenario));
-    });
-
-    test(`RFC 3339 corpus / session call site / ${scenario.name}`, () => {
-        // server/Session.ts:358
+    test(`RFC 3339 corpus / ${scenario.name}`, () => {
         const accepted = !Number.isNaN(parseRfc3339(scenario.input));
         expect(
             accepted,
