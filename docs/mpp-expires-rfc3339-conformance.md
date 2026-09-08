@@ -404,9 +404,10 @@ what.**
 
 ## Reproduce
 
-**Six of the seven trees exit non-zero, and that is the correct result**, so the commands are not chained
-with `&&`. **Every line states the number of tests it must run**, because a wrong `-run` pattern or a
-stale path exits 0 on several of these toolchains.
+**Six of the seven trees exit non-zero**, so the commands are not chained with `&&`. For five that is the
+correct result; php's `127` is an absent runner, not a divergence. **Every line states the number of
+tests it must run**, because a wrong `-run` pattern or a stale path exits 0 on several of these
+toolchains.
 
 ```
 # 1. Hash gate. If it does not match, nothing below applies. From the repository root:
@@ -430,8 +431,8 @@ npx vitest run packages/mpp/src/__tests__/client-charge-validation.test.ts # exi
 # ruby  from ruby/;  needs ruby >= 3.1, see the prerequisites table
 bundle exec ruby test/pay_core/expires_rfc3339_test.rb                    # exit 1, 18 FAIL of 124
 
-# php  from php/;  composer install first
-./vendor/bin/phpunit tests/PayCore/Rfc3339Test.php                        # exit 1, 17 FAIL of 124
+# php  from php/;  composer install first. NOT RE-RUN on this pass: composer absent, exit 127
+./vendor/bin/phpunit tests/PayCore/Rfc3339Test.php                        # 17 FAIL of 124, carried
 
 # lua  from lua/;  the suite's runner is tests/test_helper.lua in-repo, not busted
 lua -e "package.path=table.concat({'./?.lua','./?/init.lua',package.path},';'); \
@@ -439,8 +440,19 @@ lua -e "package.path=table.concat({'./?.lua','./?/init.lua',package.path},';'); 
 #   exit 1, 1 of 8 tests fails, printing "16 of 124 vectors diverge"
 ```
 
-The numbers those commands printed, not a prediction. The `fail` column counts corpus vectors and equals
-the headline table row for row.
+The numbers those commands printed, not a prediction; php's are carried from `16777d46`, per the header.
+The `fail` column counts corpus vectors and equals the headline table row for row, except typescript:
+the `npx vitest` line drives `parseRfc3339` under #286 and returns 6, where the headline rows are the
+merged tree's 22 each. No adapter implements `expires.parse` (`harness/src/protocol/README.md:68`), so those two
+are evaluated directly, from the repository root:
+
+```
+node -e 'const s=require("./harness/vectors/mpp-protocol/expires.json").scenarios;
+  for(const[n,f]of[["charge",x=>new Date(x).getTime()],["session",x=>Date.parse(x)]])
+    console.log(n,s.filter(v=>!Number.isNaN(f(v.input))!==(v.tests.parse===true)).length)'
+# charge 22
+# session 22                                                               exit 0
+```
 
 | tree | working directory | exit | tests run | corpus vectors driven | pass | **fail** |
 |---|---|---|---|---|---|---|
@@ -509,7 +521,7 @@ Every row was established by running the command above, not by reading a manifes
 | rust | a resolvable workspace. **It does not resolve offline**: `cargo test --offline` fails on a `solana-bpf-loader-program` version conflict via `litesvm`, pre-existing and unrelated to these vectors | `cargo --version` gives `1.96.1` |
 | typescript | `pnpm install` in `typescript/` | `node --version` gives `v26.0.0` |
 | ruby | `bundle install`, **and ruby >= 3.1**, see below | `ruby --version` |
-| php | `composer install` in `php/` | `php --version` gives `8.5.9` |
+| php | `composer install` in `php/`. **Not met on this host**, so the row is carried | `php --version` gives `8.5.9`; `which composer` exits 1 |
 | lua | none. The runner is `lua/tests/test_helper.lua`, in-repo; busted is not a dependency. **`lua tests/run.lua` (the whole suite) additionally needs `luasodium` from luarocks; the single-spec invocation above does not** | `lua -v` gives `Lua 5.5.1` |
 
 **The ruby row.** `bundle exec` cannot run under ruby 2.6.10: the gemspec requires `ed25519 ~> 1.4`
