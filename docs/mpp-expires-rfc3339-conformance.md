@@ -8,26 +8,40 @@ vectors vendored at `harness/vectors/mpp-protocol/expires.json` (issue #111).
   70 REJECT), 36,470 B, sha256 `72f90dc9c9e6d7c373fcae7893e1d9f0c537ecc69fc7397773d5b006a78e0e3d`.
 - Parse paths: go, lua, php, python, ruby, rust, typescript; typescript has two call sites, so eight.
 - Operation `expires.parse`. Verdict axis ACCEPT or REJECT. Cells: 124 x 8 = 992.
-- Source lines resolve at `16777d465f4446c7ac519378663d6d4bbf394877`, the merge base.
+- Source lines resolve at `48ea8aa43fb555d55fd9c3365a4a045ea96f1618`, this branch merged with main
+  `c143bfabef82dbdf01dcff7a52ab29bf166d7eb4`.
+- **The typescript rows measure `parseRfc3339`, which arrives with #286** (head `cda74a47`) and is not on
+  main. It was applied to the worktree to take the measurement and is not committed here. Without it the
+  typescript suite fails to load and runs no tests; it does not go green.
+- **php was not re-executed on this run.** composer is absent from the host, so `php/vendor/` and
+  `vendor/bin/phpunit` do not exist. `git diff --name-only 16777d46 c143bfab -- php/` returns nothing, so
+  the php parse path is byte-identical and the row is carried from the `16777d46` measurement. Every table
+  that uses it says so.
 - Sources, upstream shas, licences, the dedupe rule and every settled scenario not shipped are in
   `harness/vectors/mpp-protocol/README.md`.
 
 ## Headline
 
-**The corpus is not green: 120 of 992 cells diverge, 12.1%. One parse path of eight passes all 124.**
+**The corpus is not green: 88 of 992 cells diverge, 8.9%. One parse path of eight passes all 124.**
 Every divergence is a verdict disagreement, not a crash; no cell produced anything but ACCEPT or REJECT.
 
 | parse path | scenarios | pass | **fail** |
 |---|---|---|---|
 | rust | 124 | 124 | **0** |
+| typescript, charge call site | 124 | 118 | **6** |
+| typescript, session call site | 124 | 118 | **6** |
 | python | 124 | 115 | **9** |
 | go | 124 | 108 | **16** |
 | lua | 124 | 108 | **16** |
-| php | 124 | 107 | **17** |
+| php (carried, see header) | 124 | 107 | **17** |
 | ruby | 124 | 106 | **18** |
-| typescript, charge call site | 124 | 102 | **22** |
-| typescript, session call site | 124 | 102 | **22** |
-| **total** | **992** | **872** | **120** |
+| **total** | **992** | **904** | **88** |
+
+**Both typescript rows moved, 22 to 6 each, and #286 is the whole reason.** Its `parseRfc3339` rejects
+every one of the 16 over-acceptances the engine admitted; the 6 that remain are the leap seconds, which no
+`Date`-backed implementation can represent. Nothing on main moved a count: `#283` rewrote
+`server/Session.ts`, `core/types.py` and `challenge.rs`, and go, lua, php, python, ruby and rust returned
+the same counts they did at `16777d46`.
 
 **Scope.** Every scenario in the file is an `expires` verdict, so there is no filter and no skip; each
 tree asserts that the count it exercised equals the count in the file. The 104 settled `full-date` and
@@ -48,17 +62,22 @@ expression the SDK delegates to. The harness contains no RFC 3339 parser written
 
 | tree | parse path (file:line) | verdict source | runtime | **fail of 124** |
 |---|---|---|---|---|
-| rust | `rust/crates/kit/src/mpp/protocol/core/challenge.rs:173-184` `PaymentChallenge::is_expired` to `time::OffsetDateTime::parse(s, &Rfc3339)` | `delegated-parser` | `cargo 1.96.0`, `time` crate `0.3.55` | **0** |
+| rust | `rust/crates/kit/src/mpp/protocol/core/challenge.rs:173-184` `PaymentChallenge::is_expired` to `time::OffsetDateTime::parse(s, &Rfc3339)` | `delegated-parser` | `cargo 1.96.1`, `time` crate `0.3.55` | **0** |
+| typescript, charge | `typescript/packages/mpp/src/client/Charge.ts:402` `assertChallengeNotExpired`, a consumer of `parseRfc3339` under #286 | `repo-parser` | `node v26.0.0` | **6** |
+| typescript, session | `typescript/packages/mpp/src/server/Session.ts:356` `assertChallengeOpenNotExpired`, the other consumer | `repo-parser` | `node v26.0.0` | **6** |
 | python | `python/src/solana_pay_kit/protocols/mpp/core/types.py:28` `_parse_rfc3339` (regex `_RFC3339_RE` at `:17`, then `datetime.fromisoformat`) | `repo-parser` | `Python 3.12.13` | **9** |
 | go | `go/protocols/mpp/wire/challenge.go:110-119` `PaymentChallenge.IsExpired(now)` | `repo-parser` | `go1.26.5 darwin/arm64` | **16** |
 | lua | `lua/pay_kit/protocols/mpp/expires.lua:27` `M.parse_rfc3339` | `repo-parser` | `Lua 5.5.1` | **16** |
-| php | `php/src/PayCore/Rfc3339Parser.php:37` `Rfc3339Parser::parse` | `repo-parser` | `PHP 8.5.9 (cli)` | **17** |
+| php | `php/src/PayCore/Rfc3339Parser.php:37` `Rfc3339Parser::parse` | `repo-parser` | `PHP 8.5.9 (cli)`, carried | **17** |
 | ruby | `ruby/lib/pay_core/rfc3339_parser.rb:28` `Rfc3339Parser.parse` | `repo-parser` | `ruby 4.0.6` | **18** |
-| typescript, charge | `typescript/packages/mpp/src/client/Charge.ts:402` `assertChallengeNotExpired` to `new Date(expires).getTime()` at `:404` | `delegated-parser` | `node v26.0.0` | **22** |
-| typescript, session | `typescript/packages/mpp/src/server/Session.ts:346` `assertChallengeOpenNotExpired` to `Date.parse(expires)` at `:348` | `delegated-parser` | `node v26.0.0` | **22** |
+
+**The two typescript line numbers are the guards on the merged tree, where they still call the engine.**
+`parseRfc3339` lives at `typescript/packages/mpp/src/shared/rfc3339.ts` on #286, which repoints both to it;
+that file is not on `48ea8aa` and the numbers above will shift by one when it lands. Both rows are
+`repo-parser` on that basis, and byte-identical: one function now answers for both call sites.
 
 **Every row is a property of (SDK source x that runtime), not of the SDK alone.**
-`rust/crates/kit/Cargo.toml:153` pins `time = "0.3"` with no lockfile, so a fresh resolve takes whatever
+`rust/crates/kit/Cargo.toml:163` pins `time = "0.3"` with no lockfile, so a fresh resolve takes whatever
 `0.3.x` is current; this run resolved `0.3.55`. pay-kit's Lua rockspecs target Lua 5.1 and 5.4; this run
 used Lua 5.5.1.
 
@@ -78,11 +97,12 @@ Reported as unwired rather than as 124 disagreements.
 Nine findings, each a measurement over the shipped file unless stated otherwise. Divergence is measured,
 exploitability is not. Consequence is inference, at most once per finding, in a `> **Inference:**` block.
 
-### 1. An offsetless date-time is host-dependent in the typescript path
+### 1. An offsetless date-time was host-dependent in the typescript path, and #286 closes it
 
 `offset_absent` (`2026-01-29T12:00:00`, corpus REJECT) is the only offsetless date-time in the file,
 found by regex `^\d{4}-\d{2}-\d{2}[Tt ]\d{2}:\d{2}:\d{2}(\.\d+)?$` over all 124 inputs, not by name. Six
-trees reject it: rust, go, python, ruby, php, lua. TypeScript accepts it and reads it in host local time:
+trees reject it: rust, go, python, ruby, php, lua. Measured at `16777d46`, the engine accepted it and read
+it in host local time:
 
 ```
 TZ=UTC               2026-01-29T12:00:00  ->  2026-01-29T12:00:00.000Z
@@ -91,60 +111,65 @@ TZ=Asia/Tokyo        2026-01-29T12:00:00  ->  2026-01-29T03:00:00.000Z
 ```
 
 §5.6 makes the offset mandatory in `date-time` and §4.4 states why; ECMA-262 reads an offsetless form as
-local. **Limit:** one vector, written from the RFC text, since neither import has an offsetless
-date-time.
+local. **`parseRfc3339` rejects it**, its grammar terminating in `[Zz]` or a `±hh:mm` offset with no third
+alternative, so all seven trees now agree and the host-dependence is gone. **Limit:** one vector, written
+from the RFC text, since neither import has an offsetless date-time.
 
-> **Inference:** for any input omitting an offset, the verdict and instant this path produces are
-> properties of the host as well as the input. How such an input reaches this path is not measured.
+### 2. The typescript path evaluated ECMA-262 date-time strings, not RFC 3339; #286 closes 16 of 22
 
-### 2. The typescript path evaluates ECMA-262 date-time strings, not RFC 3339
+At `16777d46` `Charge.ts:402` `assertChallengeNotExpired` evaluated `new Date(expires).getTime()` and
+`Session.ts:346` `assertChallengeOpenNotExpired` evaluated `Date.parse(expires)` — the same V8 algorithm,
+byte-identical verdicts, 22 divergences each. **16 of the 22 were over-acceptances, an input the corpus
+rejects that the path accepted; the remaining 6 ran the other way.** #286's `parseRfc3339` rejects all 16
+and leaves the 6, so both rows are now 6. This is the finding the PR was filed on and the measurement is
+kept; what changed is that only the second half of it is still live.
 
-`Charge.ts:402` `assertChallengeNotExpired` evaluates `new Date(expires).getTime()` at `:404`;
-`Session.ts:346` `assertChallengeOpenNotExpired` evaluates `Date.parse(expires)` at `:348`. Both resolve
-at `16777d46`, are the same V8 algorithm, and return byte-identical verdicts on all 124 scenarios.
-**16 of the 22 divergences at each call site are over-acceptances, an input the corpus rejects that this
-path accepts; the remaining 6 run the other way.** Those 6 are the leap-second `date-time`s —
+**The 16 over-acceptances, all now REJECT.** Rows 1-2 and 5 were direct probes at `16777d46`; the rest are
+shipped vectors. Every `parseRfc3339` verdict below is from a run of the corpus through #286's file.
+
+| input | at `16777d46` | `parseRfc3339` | RFC 3339 |
+|---|---|---|---|
+| `2026-01-01` | `2026-01-01T00:00:00.000Z`, accepted | REJECT | REJECT, a date-only form is not a `date-time` |
+| `2026-01-01T12:00` | `2026-01-01T18:00:00.000Z`, accepted | REJECT | REJECT, `time-second` is mandatory |
+| `1990-02-31T15:59:59.123-08:00` | `1990-03-03T23:59:59.123Z`, rolled over | REJECT | REJECT, §5.7 February maximum |
+| `1990-12-31T24:00:00Z` | `1991-01-01T00:00:00.000Z`, rolled over | REJECT | REJECT, §5.7 hour 00-23 |
+| `06/19/1963 08:30:06 PST` | `1963-06-19T16:30:06.000Z`, accepted | REJECT | REJECT, not §5.6 syntax at all |
+
+Five shipped vectors took the calendar-rollover path: all corpus REJECT, all accepted at `16777d46`,
+`Session.ts` matching `Charge.ts` on each. All five are REJECT under `parseRfc3339`, which range-checks
+`date-mday` against a leap-year-aware month table rather than letting `Date` normalise the overflow away.
+
+| vector | input | at `16777d46` | rolled to | `parseRfc3339` |
+|---|---|---|---|---|
+| `feb_30` | `2026-02-30T00:00:00Z` | ACCEPT, `epochMs=1772409600000` | `2026-03-02T00:00:00.000Z` | REJECT |
+| `sep_31` | `2026-09-31T00:00:00Z` | ACCEPT, `epochMs=1790812800000` | `2026-10-01T00:00:00.000Z` | REJECT |
+| `apr_31` | `2026-04-31T00:00:00Z` | ACCEPT, `epochMs=1777593600000` | `2026-05-01T00:00:00.000Z` | REJECT |
+| `non_leap_year_1900_feb_29` | `1900-02-29T00:00:00Z` | ACCEPT, `epochMs=-2203891200000` | `1900-03-01T00:00:00.000Z` | REJECT |
+| `hour_24` | `2026-01-29T24:00:00Z` | ACCEPT, `epochMs=1769731200000` | `2026-01-30T00:00:00.000Z` | REJECT |
+
+**Three further divergences were bare-production forms. The third was the sharpest in the finding.**
+
+| vector | input | corpus | at `16777d46` | `parseRfc3339` |
+|---|---|---|---|---|
+| `bare_date_no_time` | `1963-06-19` | REJECT | `1963-06-19T00:00:00.000Z`, silently midnight UTC | REJECT |
+| `bare_date_leap_day` | `2020-02-29` | REJECT | `2020-02-29T00:00:00.000Z`, same | REJECT |
+| `bare_time_leap_second` | `23:59:60Z` | REJECT | **`1960-01-01T23:59:00.000Z`**, read as year 1960 with the leap second truncated to `:00` | REJECT |
+
+An `expires` of `23:59:60Z` did not fail at `16777d46`; it became an instant in 1960, which every
+comparison reads as long expired. `bare_time_zulu` (`08:30:06Z`) and the other three bare-time shapes were
+already rejected, so the defect was specific to the leap-second form. All three are REJECT under
+`parseRfc3339`.
+
+**The 6 that remain**, all corpus ACCEPT under §5.7, all REJECT through `parseRfc3339`:
 `jsts_date_time_005`, `jsts_date_time_006`, `leap_second_june_month_end`,
 `leap_second_offset_rolls_local_date_forward`, `rfc_5_8_example_leap_second_offset`,
-`rfc_5_8_example_leap_second_z` — all corpus ACCEPT under §5.7 and all rejected here, V8 having no
-representable 61st second; finding 6 reads one of them against its control. The over-acceptances follow.
-Rows 1-2 are direct probes, rows 3-5 the shipped vectors `jsts_date_time_010`, `jsts_date_time_013`,
-`jsts_date_time_016`.
-
-| input | `Date.parse` result | RFC 3339 |
-|---|---|---|
-| `2026-01-01` | `2026-01-01T00:00:00.000Z`, accepted | REJECT, a date-only form is not a `date-time` |
-| `2026-01-01T12:00` | `2026-01-01T18:00:00.000Z`, accepted | REJECT, `time-second` is mandatory |
-| `1990-02-31T15:59:59.123-08:00` | `1990-03-03T23:59:59.123Z`, rolled over | REJECT, §5.7 February maximum |
-| `1990-12-31T24:00:00Z` | `1991-01-01T00:00:00.000Z`, rolled over | REJECT, §5.7 hour 00-23 |
-| `06/19/1963 08:30:06 PST` | `1963-06-19T16:30:06.000Z`, accepted | REJECT, not §5.6 syntax at all |
-
-Five shipped vectors take the calendar-rollover path: all corpus REJECT, all accepted, `Session.ts`
-matching `Charge.ts` on each. `epochMs` is read from the results file; the instant beside it is decoded.
-
-| vector | input | `Charge.ts` result | rolls to |
-|---|---|---|---|
-| `feb_30` | `2026-02-30T00:00:00Z` | ACCEPT, `epochMs=1772409600000` | `2026-03-02T00:00:00.000Z` |
-| `sep_31` | `2026-09-31T00:00:00Z` | ACCEPT, `epochMs=1790812800000` | `2026-10-01T00:00:00.000Z` |
-| `apr_31` | `2026-04-31T00:00:00Z` | ACCEPT, `epochMs=1777593600000` | `2026-05-01T00:00:00.000Z` |
-| `non_leap_year_1900_feb_29` | `1900-02-29T00:00:00Z` | ACCEPT, `epochMs=-2203891200000` | `1900-03-01T00:00:00.000Z` |
-| `hour_24` | `2026-01-29T24:00:00Z` | ACCEPT, `epochMs=1769731200000` | `2026-01-30T00:00:00.000Z` |
-
-**Three further divergences are bare-production forms. The third is the sharpest in the finding.**
-
-| vector | input | corpus | `new Date(x)` / `Date.parse(x)` resolves to |
-|---|---|---|---|
-| `bare_date_no_time` | `1963-06-19` | REJECT | `1963-06-19T00:00:00.000Z`, silently becomes midnight UTC |
-| `bare_date_leap_day` | `2020-02-29` | REJECT | `2020-02-29T00:00:00.000Z`, same |
-| `bare_time_leap_second` | `23:59:60Z` | REJECT | **`1960-01-01T23:59:00.000Z`**, read as year 1960 with the leap second truncated to `:00` |
-
-An `expires` of `23:59:60Z` does not fail here; it becomes an instant in 1960, which every comparison
-reads as long expired. `bare_time_zulu` (`08:30:06Z`) and the other three bare-time shapes are correctly
-rejected, so the defect is specific to the leap-second form.
+`rfc_5_8_example_leap_second_z`. The mechanism is unchanged and is not a regex: `parseRfc3339` bounds
+`second` at 59 and, past that gate, still returns `Date.parse` of a normalised string, so it inherits
+V8's lack of a representable 61st second. Finding 6 reads one of them against its control. Tracked in #284.
 
 ### 3. An empty `expires` short-circuits the go guard and returns not-expired without parsing
 
-`go/protocols/mpp/wire/challenge.go`, read off disk at `16777d46`:
+`go/protocols/mpp/wire/challenge.go`, read off disk at `48ea8aa`, byte-identical to `16777d46`:
 
 ```go
 110: func (c PaymentChallenge) IsExpired(now time.Time) bool {
@@ -186,7 +211,7 @@ the guard, `server/server.go:457` before `:461` and `server/session_method.go:38
 (2) `expires` is in the HMAC preimage, `challenge.go:105` passing `c.Expires` to `ComputeChallengeID` as
 the sixth field (`:147`), so blanking it changes the ID and `Verify` fails first. (3) Both issuers
 default it to five minutes, `server/server.go:375-378` and `server/session_method.go:349-352`; the Rust
-issuers likewise at `charge.rs:537-538` and `:651-652`.
+issuers likewise at `charge.rs:541-542` and `:655-656`.
 
 **Defensive depth, not a vulnerability.** The early return is documented as deliberate two lines above
 the call site (`client/charge.go:293-294`):
@@ -197,8 +222,8 @@ the call site (`client/charge.go:293-294`):
 ```
 
 Three confirmations that "no expiry means not expired" is convention rather than a Go defect: that
-comment; Rust's `None => false` at `challenge.rs:175`; named tests in both trees (`challenge_test.go:46`
-`TestIsExpiredEmptyString`, `challenge.rs:534` `challenge_not_expired_when_no_expires`).
+comment; Rust's `None => false` at `challenge.rs:175`; named tests in both trees (`challenge_test.go:48`
+`TestIsExpiredEmptyString`, `challenge.rs:610` `challenge_not_expired_when_no_expires`).
 
 **The residual is the actionable part.** `NewChallengeWithSecret` (`wire/challenge.go:63-64`) is exported
 public API hardcoding `expires: ""` into `NewChallengeWithSecretFull`, re-exported as
@@ -332,10 +357,12 @@ three accepting trees split again: ruby `01:00:00+02:00`, php `00:59:59+02:00`, 
 > **Inference:** for a field whose purpose is to say when a challenge stops being valid, a difference in
 > the denoted instant is a difference in when it stops being valid. This corpus does not measure it.
 
-### 9. A space where §5.6 mandates a `T`, and a five-two split
+### 9. A space where §5.6 mandates a `T`, and a six-one split
 
-`2020-01-01 00:00:00Z`, imported from the upstream `date.json` suite with verdict REJECT. **rust and
-typescript accept it; go, python, ruby, php and lua reject it.**
+`2020-01-01 00:00:00Z`, imported from the upstream `date.json` suite with verdict REJECT. **rust accepts
+it; go, python, ruby, php, lua and typescript reject it.** At `16777d46` typescript accepted it too and
+the split was five-two; `parseRfc3339` mandates `[Tt]` between `full-date` and `full-time`, so rust is now
+alone.
 
 ```
 $ rust_runner probe.tsv
@@ -382,12 +409,12 @@ what.**
 - **The boolean axis is blind to the instant divergence in finding 8.** No golden instant is asserted for
   ACCEPT scenarios, so finding 8's four instants all score PASS. Same limit on php's truncation in
   finding 4: it accepts 7- and 9-digit fractions the corpus accepts, truncates both to six, passes both.
-- **Two trees cannot be conformance-tested through their own public surfaces.** rust's `is_expired()`
+- **One tree cannot be conformance-tested through its own public surface.** rust's `is_expired()`
   collapses parse failure and past date into one fail-closed bool and reads `OffsetDateTime::now_utc()`
-  internally; `server/session.rs:64` collapses both into `Error::ChallengeExpired`; `server/charge.rs:857`
-  distinguishes but is reachable only after a constant-time HMAC challenge-ID check. typescript's two
-  expiry checks are module-private and the package ships no RFC 3339 parser module. Hence
-  `delegated-parser` on both.
+  internally; `server/session.rs:67-69` collapses both into `Error::ChallengeExpired`; `server/charge.rs:857`
+  distinguishes but is reachable only after a constant-time HMAC challenge-ID check. Hence
+  `delegated-parser` on rust. typescript's two expiry guards are still module-private, but #286 exports
+  `parseRfc3339` beneath them, which is what the corpus now drives.
 - **Kotlin and Swift are not measured.** Neither is on `langs` in `harness/divergence-raw.json` nor in
   `harness/protocol-runners/`. pay-kit carries nine SDK trees; seven are measured here.
 - **Python 3.9 has no measurement.** The SDK does not load on it.
@@ -399,9 +426,10 @@ what.**
 
 ## Reproduce
 
-**Six of the seven trees exit non-zero, and that is the correct result**, so the commands are not chained
-with `&&`. **Every line states the number of tests it must run**, because a wrong `-run` pattern or a
-stale path exits 0 on several of these toolchains.
+**Five of the seven trees exit non-zero on a divergence, and that is the correct result**, so the commands
+are not chained with `&&`. rust exits 0; php exits 127 on this host because its runner is not installed,
+which is an absence, not a result. **Every line states the number of tests it must run**, because a wrong
+`-run` pattern or a stale path exits 0 on several of these toolchains.
 
 ```
 # 1. Hash gate. If it does not match, nothing below applies. From the repository root:
@@ -419,13 +447,13 @@ pytest tests/test_expires.py                                              # exit
 # rust  from rust/
 cargo test -p solana-pay-kit rfc3339_conformance_corpus                   # exit 0, 0 FAIL of 124
 
-# typescript  from typescript/
-npx vitest run packages/mpp/src/__tests__/client-charge-validation.test.ts # exit 1, 44 FAIL of 248
+# typescript  from typescript/;  needs #286 merged, else the suite fails to load and runs nothing
+npx vitest run packages/mpp/src/__tests__/client-charge-validation.test.ts # exit 1, 12 FAIL of 248
 
 # ruby  from ruby/;  needs ruby >= 3.1, see the prerequisites table
 bundle exec ruby test/pay_core/expires_rfc3339_test.rb                    # exit 1, 18 FAIL of 124
 
-# php  from php/;  composer install first
+# php  from php/;  composer install first.  NOT RE-RUN on this pass, see the prerequisites table
 ./vendor/bin/phpunit tests/PayCore/Rfc3339Test.php                        # exit 1, 17 FAIL of 124
 
 # lua  from lua/;  the suite's runner is tests/test_helper.lua in-repo, not busted
@@ -442,10 +470,14 @@ the headline table row for row.
 | go | repo root | 1 | 125 (`-v` to see them) | 124 | 108 | **16** |
 | python | `python/` | 1 | 144 | 124 | 135 | **9** |
 | rust | `rust/` | **0** | 3 | 124 | 3 | **0** |
-| typescript | `typescript/` | 1 | 272 | 248 (124 x 2) | 228 | **44** (22 per call site) |
+| typescript | `typescript/` | 1 | 272 | 248 (124 x 2) | 260 | **12** (6 per call site) |
 | ruby | `ruby/` | 1 | 130 | 124 | 112 | **18** |
-| php | `php/` | 1 | 145 | 124 | 128 | **17** |
+| php | `php/` | — | — | — | — | **not re-run**, composer absent |
 | lua | `lua/` | 1 | 8 | 124 | 7 | **1**, reporting 16 of 124 diverging |
+
+**The typescript row is with `shared/rfc3339.ts` from #286 in the worktree.** Without it the run is exit 1,
+`Cannot find module '../shared/rfc3339.js'`, 1 failed suite and **no tests** — the suite fails closed
+rather than passing on an engine expression, which is the point of driving the SDK's own parser.
 
 **Every tree drives all 124 scenarios. There is no filter and no skip.** Six enforce it by assertion, as
 in rust's `rfc3339_conformance_corpus_exercises_every_scenario` or lua's
@@ -480,18 +512,24 @@ done
 ```
 
 Each entry's output prints in full between the delimiters, greppable with `| grep '^====='`. Executed
-from the repository root, the eight delimiters printed:
+from the repository root with #286's `shared/rfc3339.ts` in the worktree, the eight delimiters printed:
 
 ```
 ===== gate exit 0 =====        # 72f90dc9…e0e3d
 ===== go exit 1 =====          # 125 "=== RUN" (1 parent + 124 subtests), 108 PASS, 16 FAIL
 ===== python exit 1 =====      # 9 failed, 135 passed  (144)
 ===== rust exit 0 =====        # running 3 tests; 3 passed, 0 failed
-===== typescript exit 1 =====  # 44 failed | 228 passed  (272)
+===== typescript exit 1 =====  # 12 failed | 260 passed  (272)
 ===== ruby exit 1 =====        # 130 runs, 155 assertions, 18 failures, 0 errors
-===== php exit 1 =====         # Tests: 145, Assertions: 153, Failures: 17
+===== php exit 127 =====       # ./vendor/bin/phpunit: no such file or directory
 ===== lua exit 1 =====         # 7 tests passed, 0 skipped, 1 failed, "16 of 124 vectors diverge"
 ```
+
+**php is `127`, not `1`: the binary is absent, so nothing ran.** composer is not installed on this host and
+`php/vendor/` was never created. The php row in every table above is the `16777d46` measurement, carried
+because no file under `php/` differs between `16777d46` and `c143bfab`. Re-running the same loop **without**
+#286's file moves only the typescript line, to `exit 1` with `Cannot find module '../shared/rfc3339.js'`
+and no tests run.
 
 ### Prerequisites per tree
 
@@ -501,10 +539,10 @@ Every row was established by running the command above, not by reading a manifes
 |---|---|---|
 | go | none beyond the toolchain | `go version` gives `go1.26.5 darwin/arm64` |
 | python | the SDK with dev extras (`uv sync --extra dev`, or `pip install -e ".[dev]"` in a 3.12 venv) | `python3.12 --version` gives `Python 3.12.13` |
-| rust | a resolvable workspace. **It does not resolve offline**: `cargo test --offline` fails on a `solana-bpf-loader-program` version conflict via `litesvm`, pre-existing and unrelated to these vectors | `cargo --version` gives `1.96.0` |
-| typescript | `pnpm install` in `typescript/` | `node --version` gives `v26.0.0` |
-| ruby | `bundle install`, **and ruby >= 3.1**, see below | `ruby --version` |
-| php | `composer install` in `php/` | `php --version` gives `8.5.9` |
+| rust | a resolvable workspace. **It does not resolve offline**: `cargo test --offline` fails on a `solana-bpf-loader-program` version conflict via `litesvm`, pre-existing and unrelated to these vectors | `cargo --version` gives `1.96.1` |
+| typescript | `pnpm install` in `typescript/`, **and #286 merged** for `../shared/rfc3339.js` to resolve | `node --version` gives `v26.0.0` |
+| ruby | `bundle install`, **and ruby >= 3.1**, see below | `ruby --version` gives `4.0.6` |
+| php | `composer install` in `php/`. **composer is absent from the host this pass ran on**, so the php row was not re-measured | `php --version` gives `8.5.9`; `which composer` gives nothing |
 | lua | none. The runner is `lua/tests/test_helper.lua`, in-repo; busted is not a dependency. **`lua tests/run.lua` (the whole suite) additionally needs `luasodium` from luarocks; the single-spec invocation above does not** | `lua -v` gives `Lua 5.5.1` |
 
 **The ruby row.** `bundle exec` cannot run under ruby 2.6.10: the gemspec requires `ed25519 ~> 1.4`
