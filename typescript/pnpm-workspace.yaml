@@ -9,19 +9,24 @@ allowBuilds:
 
 minimumReleaseAgeExclude:
   - js-yaml@5.2.2
+  - fast-uri@4.1.4
 
 # Force transitive `ws` past GHSA-58qx-3vcg-4xpx (uninitialized memory
 # disclosure, patched in 8.20.1). Reaches us via
 # @solana/kit > @solana/rpc-subscriptions > @solana/rpc-subscriptions-channel-websocket.
 overrides:
   ws: '^8.21.0'
-  '@x402/core': 'file:.x402-vendor/x402-core-2.16.0.tgz'
+  '@x402/core': 'file:.x402-vendor/x402-core-2.23.0.tgz'
   '@hono/node-server': '>=2.0.10'
-  fast-uri: '>=4.1.1'
-  hono: '>=4.12.25'
-  ip-address: '>=10.1.1'
+  # fast-uri/hono/ip-address floors below track advisories reached via
+  # @modelcontextprotocol/sdk (see `pnpm why <pkg>`); bump as new CVEs land.
+  fast-uri: '>=4.1.4'
+  hono: '>=4.12.34'
+  ip-address: '>=10.3.1'
   js-yaml: '>=5.2.2'
   path-to-regexp: '>=8.4.0'
-  qs: '>=6.15.2'
+  qs: '>=6.16.0'
   yaml: '>=2.8.3'
   body-parser: '>=2.3.0'
+  # GHSA-p95v-992w-h6c3: prototype pollution while decoding untrusted TOON.
+  '@toon-format/toon': '2.3.1'

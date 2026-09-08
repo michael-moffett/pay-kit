@@ -240,7 +240,16 @@ describe('session() verify() topUp', () => {
         );
 
         expect(receipt.status).toBe('success');
-        expect(receipt.reference).toBe('MockSig1');
+        expect(receipt.reference).toBe(f.channel.address);
+        // txHash is reserved for the close receipt's settlement signature
+        // (draft-solana-session-00 receipt table); a top-up carries none.
+        expect(receipt).toMatchObject({
+            acceptedCumulative: '0',
+            idleTimeoutSeconds: 300,
+            intent: 'session',
+            spent: '0',
+        });
+        expect(receipt).not.toHaveProperty('txHash');
         expect(sent).toHaveLength(1);
         expect(statusCalls).toContain('MockSig1');
         const state = await f.store.getChannel(f.channel.address);
@@ -461,13 +470,30 @@ async function watermarkedFixture(rpcOptions: { sendErrors?: number } = {}) {
 
 describe('session() verify() close monotonicity', () => {
     test('an accepted voucher advances the watermark', async () => {
-        const { f, receipt, voucher } = await watermarkedFixture();
+        const { f, method, receipt, voucher } = await watermarkedFixture();
         expect(receipt.status).toBe('success');
-        expect(receipt.reference).toBe(`${f.channel.address}:250`);
+        expect(receipt.reference).toBe(f.channel.address);
+        expect(receipt).toMatchObject({
+            acceptedCumulative: '250',
+            idleTimeoutSeconds: 300,
+            intent: 'session',
+            spent: '100',
+        });
 
         const state = await f.store.getChannel(f.channel.address);
         expect(state?.cumulative).toBe(250n);
         expect(state?.highestVoucherSignature).toBe(voucher.signature);
+
+        // An idempotent replay of the already-accepted highest voucher must
+        // not deliver additional service or debit `spent` again — repeated
+        // replays keep returning the same cached amount.
+        const replay = await verify(method, makeCred(f, { action: 'voucher', channelId: f.channel.address, voucher }));
+        expect(replay).toMatchObject({ acceptedCumulative: '250', spent: '100' });
+        const replayAgain = await verify(
+            method,
+            makeCred(f, { action: 'voucher', channelId: f.channel.address, voucher }),
+        );
+        expect(replayAgain).toMatchObject({ acceptedCumulative: '250', spent: '100' });
     });
 
     test('a voucher action whose top-level channelId diverges from the signed voucher is rejected', async () => {
@@ -523,7 +549,8 @@ describe('session() verify() close monotonicity', () => {
 
         const receipt = await verify(method, makeCred(f, { action: 'close', channelId: f.channel.address, voucher }));
         expect(receipt.status).toBe('success');
-        expect(receipt.reference).toBe('MockSig1');
+        expect(receipt.reference).toBe(f.channel.address);
+        expect(receipt).toMatchObject({ refunded: '750', txHash: 'MockSig1' });
         expect(sent).toHaveLength(1);
 
         const state = await f.store.getChannel(f.channel.address);
@@ -647,7 +674,8 @@ describe('session() verify() close authorization', () => {
             makeCred(f, { action: 'close', authentication, channelId: f.channel.address }),
         );
         expect(receipt.status).toBe('success');
-        expect(receipt.reference).toBe('MockSig1');
+        expect(receipt.reference).toBe(f.channel.address);
+        expect(receipt).toMatchObject({ refunded: '1000', txHash: 'MockSig1' });
         expect(sent).toHaveLength(1);
 
         const state = await f.store.getChannel(f.channel.address);

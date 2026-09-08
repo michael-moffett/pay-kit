@@ -82,22 +82,25 @@ pub use protocol::intents::{
     AuthenticateMethodDetails, AuthenticatePayload, AuthenticateRequest, ChargeRequest,
     ClosePayload, CommitPayload, CommitReceipt, CommitStatus, MeteredEnvelope, MeteringDirective,
     MeteringUsage, OpenPayload, SessionAction, SessionAuthentication, SessionAuthenticationType,
-    SessionMethodDetails, SessionRequest, SessionSplit, SessionVoucherSigner, SignedVoucher,
-    SubscriptionAction, SubscriptionPeriodUnit, SubscriptionReceiptExtensions, SubscriptionRequest,
-    TopUpPayload, UsePayload, VoucherData, VoucherPayload, VoucherSignatureType,
-    DEFAULT_SESSION_EXPIRES_AT, MAX_IDLE_TIMEOUT_SECONDS, RESOURCE_SCHEME_HTTP,
-    RESOURCE_SCHEME_SOLANA_SESSION, RESOURCE_SCHEME_SOLANA_SUBSCRIPTION,
+    SessionMethodDetails, SessionReceiptExtensions, SessionReceiptIntent, SessionRequest,
+    SessionSplit, SessionVoucherSigner, SignedVoucher, SubscriptionAction, SubscriptionPeriodUnit,
+    SubscriptionReceiptExtensions, SubscriptionRequest, TopUpPayload, UsePayload, VoucherData,
+    VoucherPayload, VoucherSignatureType, DEFAULT_SESSION_EXPIRES_AT, MAX_IDLE_TIMEOUT_SECONDS,
+    RESOURCE_SCHEME_HTTP, RESOURCE_SCHEME_SOLANA_SESSION, RESOURCE_SCHEME_SOLANA_SUBSCRIPTION,
     SESSION_AUTHENTICATION_DOMAIN, SIGNATURE_SCHEME_SIWMPP, SIGNATURE_TYPE_ED25519, SIWMPP_VERSION,
 };
 
 pub use protocol::solana::{
     default_token_program_for_currency, mints, programs, resolve_stablecoin_mint,
+    try_resolve_stablecoin_mint,
 };
 
 // Store types
 pub use store::{
-    ChannelState, ChannelStore, CommittedDelivery, MemoryChannelStore, MemoryStore,
-    PendingDelivery, Store, StoreError, CHANNEL_STATE_SCHEMA_VERSION,
+    ChannelState, ChannelStore, ChargeRecord, ChargeRecordState, ChargeReplayStore,
+    ChargeReservation, CommittedDelivery, MemoryChannelStore, MemoryStore, PendingDelivery, Store,
+    StoreError, CHANNEL_STATE_SCHEMA_VERSION, CHARGE_RESERVATION_LEASE,
+    DEFAULT_CHARGE_RECORD_RETENTION,
 };
 
 // Re-export crates callers need to use with the charge builder.

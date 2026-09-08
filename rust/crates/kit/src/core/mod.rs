@@ -16,6 +16,8 @@
 //!   acceptance, shared by the MPP `session` intent and the x402
 //!   `batch-settlement` scheme.
 
+pub(crate) mod base58;
+pub mod batch_verify;
 pub mod blockhash;
 pub mod mints;
 #[cfg(feature = "otel")]
@@ -26,6 +28,7 @@ pub mod session;
 pub mod settlement;
 pub mod signing;
 pub mod store;
+pub mod tx_pipeline;
 pub mod units;
 pub mod voucher;
 

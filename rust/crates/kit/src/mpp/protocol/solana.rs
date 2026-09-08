@@ -68,6 +68,9 @@ pub fn default_rpc_url(network: &str) -> &'static str {
 /// Resolve a stablecoin symbol to a mint address for a network.
 ///
 /// Returns `None` for native SOL and passes through unknown symbols/mints.
+/// Call [`try_resolve_stablecoin_mint`] when the currency may be `USDtest` so
+/// unsupported networks produce an actionable error rather than reaching a
+/// later pubkey parser as an unknown symbol.
 pub fn resolve_stablecoin_mint<'a>(currency: &'a str, network: Option<&str>) -> Option<&'a str> {
     match currency.to_uppercase().as_str() {
         "SOL" => None,
@@ -76,6 +79,7 @@ pub fn resolve_stablecoin_mint<'a>(currency: &'a str, network: Option<&str>) -> 
             Some("testnet") => mints::USDC_TESTNET,
             _ => mints::USDC_MAINNET,
         }),
+        "USDTEST" if network == Some(NETWORK_DEVNET) => Some(mints::USDTEST_DEVNET),
         "USDT" => Some(mints::USDT_MAINNET),
         "USDG" => Some(match network {
             Some("devnet") => mints::USDG_DEVNET,
@@ -93,16 +97,37 @@ pub fn resolve_stablecoin_mint<'a>(currency: &'a str, network: Option<&str>) -> 
     }
 }
 
+/// Resolve a stablecoin symbol while enforcing network-specific availability.
+///
+/// `USDtest` exists on devnet only. An omitted network defaults to mainnet per
+/// the MPP specification and is rejected just like an explicit mainnet or
+/// localnet selection.
+pub fn try_resolve_stablecoin_mint<'a>(
+    currency: &'a str,
+    network: Option<&str>,
+) -> Result<Option<&'a str>, crate::mpp::error::Error> {
+    let is_usdtest = currency.eq_ignore_ascii_case("USDtest") || currency == mints::USDTEST_DEVNET;
+    if is_usdtest && network != Some(NETWORK_DEVNET) {
+        let actual = network.unwrap_or(DEFAULT_NETWORK);
+        return Err(crate::mpp::error::Error::InvalidConfig(format!(
+            "USDtest is devnet-only; set network to `devnet` (got `{actual}`)"
+        )));
+    }
+    Ok(resolve_stablecoin_mint(currency, network))
+}
+
 fn stablecoin_uses_token_2022(mint: &str) -> bool {
-    matches!(
-        mint,
-        mints::PYUSD_MAINNET
-            | mints::PYUSD_DEVNET
-            | mints::USDG_MAINNET
-            | mints::USDG_DEVNET
-            | mints::CASH_MAINNET
-            | mints::USDPT_MAINNET
-    )
+    mint.eq_ignore_ascii_case("USDtest")
+        || matches!(
+            mint,
+            mints::USDTEST_DEVNET
+                | mints::PYUSD_MAINNET
+                | mints::PYUSD_DEVNET
+                | mints::USDG_MAINNET
+                | mints::USDG_DEVNET
+                | mints::CASH_MAINNET
+                | mints::USDPT_MAINNET
+        )
 }
 
 /// Whether `mint` is a well-known stablecoin whose Token-2022 mint enables the
@@ -122,6 +147,7 @@ pub fn is_known_stablecoin_mint(mint: &str) -> bool {
         mint,
         mints::USDC_MAINNET
             | mints::USDC_DEVNET
+            | mints::USDTEST_DEVNET
             | mints::USDT_MAINNET
             | mints::USDG_MAINNET
             | mints::USDG_DEVNET
@@ -142,6 +168,72 @@ pub fn default_token_program_for_currency(currency: &str, network: Option<&str>)
         Some(mint) if stablecoin_uses_token_2022(mint) => programs::TOKEN_2022_PROGRAM,
         _ => programs::TOKEN_PROGRAM,
     }
+}
+
+// ── Prepared-transaction bounds ──
+//
+// Shared numeric ceilings for the prepared charge/message builder in
+// `mpp::client::charge` (`ComputeBudgetOptions`, `check_transaction_packet_size`).
+// Kept here rather than in `mpp::client::charge` because a future direct
+// `pay push` batch path (outside this crate) is expected to enforce the same
+// bounds without depending on the charge/challenge builder module.
+
+/// Solana's hard per-transaction compute-unit ceiling (the runtime rejects
+/// any `SetComputeUnitLimit` above this).
+///
+/// Hardcoded rather than imported: `solana-compute-budget-interface` is
+/// resolved elsewhere in this workspace's `Cargo.lock` (pulled in by
+/// unrelated SVM-runtime crates) but is not a dependency of this crate, and
+/// taking it on would pull in the SVM runtime for one `u32` constant. This
+/// value is a stable Solana network protocol invariant, not implementation
+/// detail that could silently drift underneath us.
+pub const SOLANA_MAX_COMPUTE_UNIT_LIMIT: u32 = 1_400_000;
+
+/// A generous client-side sanity ceiling for `SetComputeUnitPrice`
+/// (micro-lamports), applied by
+/// `mpp::client::charge::ComputeBudgetOptions::validate`. Not a protocol
+/// limit — just a guard against a caller accidentally passing an absurd
+/// priority fee that would massively overpay. Matches the anti-abuse ceiling
+/// PayKit's server side already applies to client-paid charges
+/// (`mpp::server::charge::MAX_COMPUTE_UNIT_PRICE_MICROLAMPORTS`).
+pub const MAX_CLIENT_COMPUTE_UNIT_PRICE_MICROLAMPORTS: u64 = 5_000_000;
+
+/// Maximum serialized byte size of a Solana transaction, i.e. the
+/// `solana-packet` crate's `PACKET_DATA_SIZE` (minimum IPv6 MTU of `1280`
+/// minus a `40`-byte IPv6 header minus an `8`-byte UDP header). Solana's
+/// networking stack rejects any transaction whose wire size exceeds this.
+///
+/// Duplicated here instead of depending on the `solana-packet` crate (also
+/// only reachable transitively elsewhere in this workspace's `Cargo.lock`,
+/// not a dependency of this crate) because the formula is a fixed IPv6/UDP
+/// protocol invariant, not implementation detail — value and derivation
+/// match `solana_packet::PACKET_DATA_SIZE` exactly (`1232`).
+pub const PACKET_DATA_SIZE: usize = 1280 - 40 - 8;
+
+/// Reject a transaction whose serialized size exceeds Solana's packet limit
+/// ([`PACKET_DATA_SIZE`]) before it is signed.
+///
+/// `bincode`-serializes `tx` exactly as it would be sent over the wire.
+/// Calling this on an *unsigned* transaction built with the correct number
+/// of (zeroed) signature slots — e.g. via `Transaction::new_unsigned` —
+/// gives the same length as after signing, since Ed25519 signatures are a
+/// fixed 64 bytes: callers can reject an oversized prepared message before
+/// ever touching a signer.
+pub fn check_transaction_packet_size(
+    tx: &solana_transaction::Transaction,
+) -> Result<usize, crate::mpp::error::Error> {
+    let size = bincode::serialize(tx)
+        .map_err(|e| {
+            crate::mpp::error::Error::Other(format!("Failed to measure transaction size: {e}"))
+        })?
+        .len();
+    if size > PACKET_DATA_SIZE {
+        return Err(crate::mpp::error::Error::TransactionTooLarge {
+            size,
+            limit: PACKET_DATA_SIZE,
+        });
+    }
+    Ok(size)
 }
 
 #[cfg(test)]
@@ -216,6 +308,7 @@ mod tests {
 
         assert!(Pubkey::from_str(mints::USDC_MAINNET).is_ok());
         assert!(Pubkey::from_str(mints::USDC_DEVNET).is_ok());
+        assert!(Pubkey::from_str(mints::USDTEST_DEVNET).is_ok());
         assert!(Pubkey::from_str(mints::USDT_MAINNET).is_ok());
         assert!(Pubkey::from_str(mints::USDG_MAINNET).is_ok());
         assert!(Pubkey::from_str(mints::USDG_DEVNET).is_ok());
@@ -235,6 +328,16 @@ mod tests {
             resolve_stablecoin_mint("USDC", Some("devnet")),
             Some(mints::USDC_DEVNET)
         );
+        assert_eq!(
+            try_resolve_stablecoin_mint("USDtest", Some("devnet")).unwrap(),
+            Some(mints::USDTEST_DEVNET)
+        );
+        for network in [None, Some("mainnet"), Some("testnet"), Some("localnet")] {
+            let error = try_resolve_stablecoin_mint("usdtest", network).unwrap_err();
+            assert!(error.to_string().contains("USDtest is devnet-only"));
+            let error = try_resolve_stablecoin_mint(mints::USDTEST_DEVNET, network).unwrap_err();
+            assert!(error.to_string().contains("USDtest is devnet-only"));
+        }
         assert_eq!(
             resolve_stablecoin_mint("USDT", None),
             Some(mints::USDT_MAINNET)
@@ -260,6 +363,14 @@ mod tests {
 
     #[test]
     fn stablecoins_default_to_correct_token_program() {
+        assert_eq!(
+            default_token_program_for_currency("USDtest", Some("devnet")),
+            programs::TOKEN_2022_PROGRAM
+        );
+        assert_eq!(
+            default_token_program_for_currency(mints::USDTEST_DEVNET, Some("devnet")),
+            programs::TOKEN_2022_PROGRAM
+        );
         assert_eq!(
             default_token_program_for_currency("CASH", None),
             programs::TOKEN_2022_PROGRAM
@@ -548,13 +659,9 @@ mod tests {
     }
 
     #[test]
-    fn validate_splits_rejects_zero_amount() {
+    fn validate_splits_accepts_zero_amount() {
         let splits = vec![split(&unique_pubkey(), "0")];
-        let err = validate_splits(&splits).err().expect("zero amount");
-        assert!(
-            format!("{err}").contains("amount must be greater than zero"),
-            "got: {err}"
-        );
+        validate_splits(&splits).expect("zero-value legs are preserved");
     }
 
     #[test]
@@ -569,14 +676,38 @@ mod tests {
     }
 
     #[test]
-    fn validate_splits_rejects_duplicate_recipient() {
+    fn validate_splits_accepts_duplicate_recipient_with_distinct_memos() {
+        let dup = unique_pubkey();
+        let mut first = split(&dup, "100");
+        first.memo = Some("platform fee".to_string());
+        let mut second = split(&dup, "200");
+        second.memo = Some("referral".to_string());
+        let splits = vec![first, second];
+        validate_splits(&splits).expect("duplicate recipients are distinct legs");
+    }
+
+    #[test]
+    fn validate_splits_rejects_duplicate_recipient_and_memo() {
         let dup = unique_pubkey();
         let splits = vec![split(&dup, "100"), split(&dup, "200")];
-        let err = validate_splits(&splits).err().expect("duplicate recipient");
+        let err = validate_splits(&splits)
+            .err()
+            .expect("duplicate recipient and memo should be rejected");
         assert!(
-            format!("{err}").contains("duplicate recipient"),
+            format!("{err}").contains("duplicate recipient and memo"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn validate_splits_treats_empty_memo_as_absent() {
+        let dup = unique_pubkey();
+        let mut with_empty_memo = split(&dup, "200");
+        with_empty_memo.memo = Some(String::new());
+        let err = validate_splits(&[split(&dup, "100"), with_empty_memo])
+            .err()
+            .expect("empty memo must not create a distinct settlement leg");
+        assert!(format!("{err}").contains("duplicate recipient and memo"));
     }
 
     // ── Confidential transfers: registry ──
@@ -744,6 +875,97 @@ mod tests {
             .expect("splits rejected");
         assert!(format!("{err}").contains("splits"), "got: {err}");
     }
+
+    // ── check_transaction_packet_size ──
+
+    fn instruction_with_data_len(len: usize) -> solana_instruction::Instruction {
+        solana_instruction::Instruction {
+            program_id: solana_pubkey::Pubkey::new_unique(),
+            accounts: vec![],
+            data: vec![0u8; len],
+        }
+    }
+
+    fn unsigned_tx_with_instruction(
+        ix: solana_instruction::Instruction,
+    ) -> solana_transaction::Transaction {
+        let payer = solana_pubkey::Pubkey::new_unique();
+        let message = solana_message::Message::new_with_blockhash(
+            &[ix],
+            Some(&payer),
+            &solana_hash::Hash::default(),
+        );
+        solana_transaction::Transaction::new_unsigned(message)
+    }
+
+    #[test]
+    fn check_transaction_packet_size_accepts_small_transaction() {
+        let tx = unsigned_tx_with_instruction(instruction_with_data_len(10));
+        let size = check_transaction_packet_size(&tx).expect("small tx must be accepted");
+        assert!(size < PACKET_DATA_SIZE);
+    }
+
+    #[test]
+    fn check_transaction_packet_size_rejects_oversized_transaction() {
+        let tx = unsigned_tx_with_instruction(instruction_with_data_len(PACKET_DATA_SIZE + 200));
+        let err = check_transaction_packet_size(&tx).expect_err("oversized tx must be rejected");
+        match err {
+            crate::mpp::error::Error::TransactionTooLarge { size, limit } => {
+                assert!(size > limit);
+                assert_eq!(limit, PACKET_DATA_SIZE);
+            }
+            other => panic!("expected TransactionTooLarge, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_transaction_packet_size_boundary_exact_limit_accepted_one_more_byte_rejected() {
+        // Find the exact instruction-data padding that lands the serialized
+        // transaction exactly on PACKET_DATA_SIZE by direct measurement,
+        // incrementing one byte at a time. bincode's length-prefix encoding
+        // is not a fixed width, so a padding length computed from a single
+        // "fixed overhead" measurement (assuming +1 byte of data == +1
+        // serialized byte) is not reliable near varint-width boundaries.
+        let mut pad = 0usize;
+        let mut size = bincode::serialize(&unsigned_tx_with_instruction(
+            instruction_with_data_len(pad),
+        ))
+        .unwrap()
+        .len();
+        assert!(
+            size < PACKET_DATA_SIZE,
+            "test assumption violated: base size {size} already >= limit"
+        );
+        while size < PACKET_DATA_SIZE {
+            pad += 1;
+            size = bincode::serialize(&unsigned_tx_with_instruction(instruction_with_data_len(
+                pad,
+            )))
+            .unwrap()
+            .len();
+        }
+        assert_eq!(
+            size, PACKET_DATA_SIZE,
+            "expected to land exactly on the limit"
+        );
+
+        let exact_tx = unsigned_tx_with_instruction(instruction_with_data_len(pad));
+        assert!(
+            check_transaction_packet_size(&exact_tx).is_ok(),
+            "exactly at the limit must be accepted"
+        );
+
+        let over_tx = unsigned_tx_with_instruction(instruction_with_data_len(pad + 1));
+        let over_size = bincode::serialize(&over_tx).unwrap().len();
+        assert!(
+            over_size > PACKET_DATA_SIZE,
+            "expected the next byte to push size strictly over the limit"
+        );
+        assert!(
+            check_transaction_packet_size(&over_tx).is_err(),
+            "one byte over the limit must be rejected"
+        );
+    }
 }
 
 /// Solana-specific method details in the challenge request.
@@ -835,9 +1057,12 @@ pub const MAX_SPLITS: usize = 8;
 /// Checks (each callsite gets the same error shape):
 /// 1. `splits.len() <= MAX_SPLITS`.
 /// 2. Each `split.recipient` parses as a `Pubkey`.
-/// 3. Each `split.amount` parses as `u64` AND is non-zero.
+/// 3. Each `split.amount` parses as `u64`.
 /// 4. The aggregate sum fits in `u64` (`checked_sum_split_amounts` is `Some`).
-/// 5. No duplicate `recipient` across splits.
+///
+/// Zero-value legs and repeated recipients are valid. Each `(recipient,
+/// memo)` pair must be unique so a repeated recipient remains a distinct,
+/// identifiable payment leg; callers must not normalize or coalesce them.
 ///
 /// Application-level recipient allowlists are out of scope — an SDK
 /// shouldn't bake in domain-specific policy.
@@ -850,26 +1075,24 @@ pub fn validate_splits(splits: &[Split]) -> Result<(), crate::mpp::error::Error>
         return Err(Error::TooManySplits);
     }
 
-    let mut seen_recipients: HashSet<&str> = HashSet::with_capacity(splits.len());
+    let mut seen_legs: HashSet<(&str, Option<&str>)> = HashSet::with_capacity(splits.len());
     for (idx, split) in splits.iter().enumerate() {
         solana_pubkey::Pubkey::from_str(&split.recipient).map_err(|e| {
             Error::InvalidConfig(format!("splits[{idx}]: invalid recipient pubkey: {e}"))
         })?;
-        let amount = split.amount.parse::<u64>().map_err(|_| {
+        split.amount.parse::<u64>().map_err(|_| {
             Error::InvalidConfig(format!(
                 "splits[{idx}]: amount `{}` is not a valid u64",
                 split.amount
             ))
         })?;
-        if amount == 0 {
+        // Settlement omits an empty memo from the instruction, so treat it as
+        // the same leg as no memo rather than accepting a challenge the
+        // settlement path cannot reproduce.
+        let memo = split.memo.as_deref().filter(|memo| !memo.is_empty());
+        if !seen_legs.insert((split.recipient.as_str(), memo)) {
             return Err(Error::InvalidConfig(format!(
-                "splits[{idx}]: amount must be greater than zero"
-            )));
-        }
-        if !seen_recipients.insert(split.recipient.as_str()) {
-            return Err(Error::InvalidConfig(format!(
-                "splits[{idx}]: duplicate recipient `{}`",
-                split.recipient
+                "splits[{idx}]: duplicate recipient and memo"
             )));
         }
     }

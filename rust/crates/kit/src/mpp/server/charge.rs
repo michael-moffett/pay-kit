@@ -51,7 +51,9 @@ use crate::mpp::protocol::intents::ChargeRequest;
 use crate::mpp::protocol::solana::{
     default_rpc_url, programs, CredentialPayload, MethodDetails, Split, MAX_MEMO_BYTES,
 };
-use crate::mpp::store::{MemoryStore, Store};
+use crate::mpp::store::{
+    ChargeReplayStore, ChargeReservation, MemoryStore, Store, CHARGE_RESERVATION_LEASE,
+};
 
 const SECRET_KEY_ENV_VAR: &str = "MPP_SECRET_KEY";
 const METHOD_NAME: &str = "solana";
@@ -142,7 +144,9 @@ fn resolve_server_token_program(
         return Ok(None);
     }
 
-    if let Some(mint) = crate::mpp::protocol::solana::resolve_stablecoin_mint(currency, network) {
+    if let Some(mint) =
+        crate::mpp::protocol::solana::try_resolve_stablecoin_mint(currency, network)?
+    {
         if crate::mpp::protocol::solana::is_known_stablecoin_mint(mint) {
             return Ok(Some(
                 crate::mpp::protocol::solana::default_token_program_for_currency(currency, network),
@@ -572,10 +576,10 @@ impl Mpp {
             ));
         }
 
-        // Audit #21: validate the splits up-front so malformed entries
-        // (bad pubkey, unparseable/zero amount, overflowing aggregate,
-        // duplicate recipients, too many splits) fail at challenge issuance
-        // instead of at on-chain settlement.
+        // Validate malformed entries (bad pubkey, unparseable amount,
+        // overflowing aggregate, too many splits) at challenge issuance.
+        // Zero-value legs are intentional wire data. Repeated recipients
+        // remain distinct when their memos differ.
         crate::mpp::protocol::solana::validate_splits(&options.splits)?;
 
         // Audit #38: spec §9.5 forbids fee-payer-funded ATA creation for the
@@ -606,10 +610,10 @@ impl Mpp {
                 "ataCreationRequired requires an SPL token currency".into(),
             ));
         }
-        if crate::mpp::protocol::solana::resolve_stablecoin_mint(
+        if crate::mpp::protocol::solana::try_resolve_stablecoin_mint(
             &self.currency,
             Some(&self.network),
-        ) != Some(self.currency.as_str())
+        )? != Some(self.currency.as_str())
         {
             return Err(Error::InvalidConfig(
                 "ataCreationRequired requires currency to be an SPL token mint address".into(),
@@ -717,10 +721,7 @@ impl Mpp {
                 }
             }
 
-            // Audit #21: shared split validation with the
-            // `charge_with_options` path. Failure modes (bad pubkey,
-            // unparseable/zero amount, overflowing aggregate, duplicate
-            // recipients, too many splits) all surface here.
+            // Shared split validation with the `charge_with_options` path.
             if let Some(splits) = md.splits.as_deref() {
                 crate::mpp::protocol::solana::validate_splits(splits)?;
             }
@@ -918,22 +919,115 @@ impl Mpp {
             ));
         }
 
+        // ── Idempotent replay guard ──
+        //
+        // `consume_signature` (used inside `settle_payload` below) prevents
+        // the same on-chain signature from ever being reserved twice, but on
+        // its own it produces the wrong outcome for a pull-mode retry:
+        // Ed25519 signing is deterministic, so replaying an already-signed
+        // credential reproduces the exact same final signature and used to
+        // fail `consume_signature`'s "already consumed" check with a bare
+        // internal error instead of the canonical reject every other SDK
+        // emits. Reserve on the challenge id BEFORE doing any settlement
+        // work so a credential that was already settled is recognized here
+        // and rejected with the same `signature_consumed` code TypeScript
+        // and Ruby use — resubmitting a completed charge is a reject, not a
+        // silent success, per the cross-SDK harness contract.
+        let challenge_id = credential.challenge.id.clone();
+        let digest =
+            normalized_request_digest(&challenge_id, credential.challenge.request.raw(), &payload)?;
+        let charge_store = self.charge_replay_store();
+        match charge_store
+            .reserve(&challenge_id, &digest, CHARGE_RESERVATION_LEASE)
+            .await
+            .map_err(|e| VerificationError::new(format!("Store error: {e}")))?
+        {
+            ChargeReservation::AlreadyConfirmed { final_signature } => {
+                // "already consumed" is load-bearing: canonical-code
+                // classifiers (this harness's `classify_canonical_code` and
+                // its TS/Python/Ruby counterparts) pattern-match error text
+                // rather than reading `VerificationError::code` directly, so
+                // the wording has to agree with `consume_signature`'s
+                // "Transaction signature already consumed" message below.
+                return Err(VerificationError::signature_consumed(format!(
+                    "Transaction signature already consumed — challenge {challenge_id} was \
+                     already settled (tx {final_signature})"
+                )));
+            }
+            ChargeReservation::AlreadyFailed { reason } => {
+                return Err(VerificationError::new(reason));
+            }
+            ChargeReservation::InProgress => {
+                return Err(VerificationError::settlement_in_progress(
+                    "This challenge is already being settled by another request; retry shortly",
+                ));
+            }
+            ChargeReservation::Conflict => {
+                return Err(VerificationError::challenge_conflict(
+                    "This challenge was already presented with a different request or credential",
+                ));
+            }
+            ChargeReservation::Reserved => {}
+        }
+
         // Settle, with the consume_signature reservation sitting between
         // broadcast and confirmation polling. If the server crashes or the
         // poll loop times out after the transaction has already landed,
         // the signature is still reserved so a retry of the same credential
         // cannot trigger a second broadcast. See PR #85 Greptile P1 and
         // audit gap G05.
-        let signature_str = match payload {
-            CredentialPayload::Transaction { ref transaction } => {
+        match self
+            .settle_payload(&payload, request, &method_details)
+            .await
+        {
+            Ok(signature_str) => {
+                if let Err(e) = charge_store
+                    .mark_confirmed(&challenge_id, &signature_str)
+                    .await
+                {
+                    tracing::warn!(
+                        error = %e,
+                        challenge_id = %challenge_id,
+                        "failed to persist confirmed charge record"
+                    );
+                }
+                Ok(Receipt::success(METHOD_NAME, &signature_str, challenge_id))
+            }
+            Err(err) => {
+                if let Err(e) = charge_store.mark_failed(&challenge_id, &err.message).await {
+                    tracing::warn!(
+                        error = %e,
+                        challenge_id = %challenge_id,
+                        "failed to persist failed charge record"
+                    );
+                }
+                Err(err)
+            }
+        }
+    }
+
+    /// Settle a decoded credential payload against `request`/`method_details`
+    /// and return the final on-chain signature.
+    ///
+    /// Extracted from `verify` so the idempotent-replay wrapper there can
+    /// catch a settlement error and persist it via
+    /// `ChargeReplayStore::mark_failed` before propagating it.
+    async fn settle_payload(
+        &self,
+        payload: &CredentialPayload,
+        request: &ChargeRequest,
+        method_details: &MethodDetails,
+    ) -> Result<String, VerificationError> {
+        match payload {
+            CredentialPayload::Transaction { transaction } => {
                 let signature = self
-                    .broadcast_pull(transaction, request, &method_details)
+                    .broadcast_pull(transaction, request, method_details)
                     .await?;
                 self.consume_signature(&signature).await?;
                 self.await_pull_confirmation(&signature)?;
-                signature
+                Ok(signature)
             }
-            CredentialPayload::Signature { ref signature } => {
+            CredentialPayload::Signature { signature } => {
                 // Audit #5: push-mode acceptance is opt-in. Spec §13.5 names
                 // "first accepted presentation wins" as the model — any
                 // matching-shape on-chain tx can claim any matching-shape
@@ -957,39 +1051,37 @@ impl Mpp {
                         "Push-mode credentials are not allowed when the route uses a server-side fee payer",
                     ));
                 }
-                let signature_str = self.verify_push(signature, request, &method_details)?;
+                let signature_str = self.verify_push(signature, request, method_details)?;
                 self.consume_signature(&signature_str).await?;
-                signature_str
+                Ok(signature_str)
             }
             #[cfg(feature = "confidential")]
-            CredentialPayload::Bundle { ref transactions } => {
-                let final_sig = self
-                    .settle_confidential_bundle(transactions, request, &method_details)
-                    .await?;
+            CredentialPayload::Bundle { transactions } => {
                 // The Receipt type has no pending/delivery field (its only
                 // ReceiptStatus is Success), so we emit success like the other
                 // arms once the confidential transfer has confirmed on-chain
                 // and the recipient-recovered amount matches the charge.
                 // TODO: pending-delivery semantics — a future Receipt revision
                 // could mark delivery as "pending" for asynchronous flows.
-                final_sig
+                self.settle_confidential_bundle(transactions, request, method_details)
+                    .await
             }
             #[cfg(not(feature = "confidential"))]
             CredentialPayload::Bundle { .. } => {
                 // Confidential-transfer bundle settlement requires the
                 // `confidential` feature (ZK proof + Token-2022 deps). Fail
                 // closed when it is not compiled in.
-                return Err(VerificationError::credential_mismatch(
+                Err(VerificationError::credential_mismatch(
                     "Confidential-transfer bundle credentials are not supported by this server (built without the `confidential` feature)",
-                ));
+                ))
             }
-        };
+        }
+    }
 
-        Ok(Receipt::success(
-            METHOD_NAME,
-            &signature_str,
-            credential.challenge.id.clone(),
-        ))
+    /// Construct the idempotent charge-settlement ledger over this `Mpp`'s
+    /// configured [`Store`]. Cheap: `ChargeReplayStore` only holds an `Arc`.
+    fn charge_replay_store(&self) -> ChargeReplayStore {
+        ChargeReplayStore::new(self.store.clone())
     }
 
     // ── Settlement ──
@@ -1721,6 +1813,53 @@ fn expected_ata_creation_policy(
     })
 }
 
+/// Compute a stable digest over everything that must match
+/// for a retried credential to be treated as "the same" settlement attempt —
+/// the challenge id (so an unrelated challenge with coincidentally matching
+/// request fields can't collide), the credential's own encoded request, and
+/// the credential payload actually presented.
+///
+/// Hashes `credential.challenge.request.raw()` — the encoded request the
+/// credential itself carries and that was HMAC-bound at challenge issuance —
+/// not the caller-supplied `expected` `ChargeRequest`. A route handler is
+/// free to reconstruct `expected` fresh on every call (e.g. re-deriving a
+/// challenge to read off its `ChargeRequest` shape), and that reconstruction
+/// can legitimately embed a volatile field never covered by
+/// `compare_expected_to_request`'s payment-constraining comparison — a
+/// pre-fetched blockhash is the concrete case (see `charge_with_options`).
+/// Hashing that value directly turns "the same credential resubmitted twice
+/// in quick succession" into two different digests purely because the
+/// caller's derived `expected` drifted between calls, which then falsely
+/// rejects the retry as a conflicting request rather than recognizing it as
+/// identical. The credential's own raw request never changes between
+/// resubmits of the same credential, so it is deterministic where the
+/// caller-supplied `expected` value cannot be.
+///
+/// `serde_json::to_vec`'s field order is fixed by each type's struct
+/// definition, so hashing `payload` is deterministic for equal inputs across
+/// processes — sufficient for an idempotency key. None of this is used for
+/// any cryptographic purpose: the HMAC challenge id already authenticates
+/// the challenge itself; this digest only distinguishes "identical retry"
+/// from "different request/credential reusing the same challenge id".
+fn normalized_request_digest(
+    challenge_id: &str,
+    encoded_request: &str,
+    payload: &CredentialPayload,
+) -> Result<String, VerificationError> {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(challenge_id.as_bytes());
+    hasher.update(encoded_request.as_bytes());
+    hasher.update(serde_json::to_vec(payload).map_err(|e| {
+        VerificationError::new(format!(
+            "Failed to hash credential payload for idempotency check: {e}"
+        ))
+    })?);
+    let digest = hasher.finalize();
+    Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
+}
+
 /// Audit #1: exhaustively compare the credential's decoded request against
 /// the route's expected request before any settlement work.
 ///
@@ -2043,7 +2182,7 @@ pub(crate) fn decode_compute_budget_op(ix: &CompiledInstruction) -> Option<Compu
     }
 }
 
-fn validate_compute_budget_instruction(
+pub(crate) fn validate_compute_budget_instruction(
     ix: &CompiledInstruction,
     fee_sponsored: bool,
 ) -> Result<(), VerificationError> {
@@ -2965,7 +3104,8 @@ pub(crate) fn resolve_expected_mint(
     currency: &str,
     network: Option<&str>,
 ) -> Result<Pubkey, VerificationError> {
-    let Some(mint) = crate::mpp::protocol::solana::resolve_stablecoin_mint(currency, network)
+    let Some(mint) = crate::mpp::protocol::solana::try_resolve_stablecoin_mint(currency, network)
+        .map_err(|error| VerificationError::invalid_payload(error.to_string()))?
     else {
         return Err(VerificationError::invalid_payload(
             "SOL does not use an SPL mint".to_string(),
@@ -3165,6 +3305,32 @@ impl VerificationError {
             "Too Many Splits",
             "tag:paymentauth.org,2024:verification-failed",
         )
+    }
+
+    /// A different request or credential tried to reuse a
+    /// challenge id that already has an in-flight or settled record with a
+    /// different [normalized digest](normalized_request_digest).
+    pub fn challenge_conflict(msg: impl Into<String>) -> Self {
+        Self::with_code(
+            msg,
+            "challenge-conflict",
+            "Challenge Already Presented With A Different Request",
+            "tag:paymentauth.org,2024:challenge-conflict",
+        )
+    }
+
+    /// An identical credential is already being settled by
+    /// another in-flight request (or its owner crashed before its
+    /// reservation lease expired). Retryable — the caller should back off
+    /// and retry; a settled result will then be returned idempotently.
+    pub fn settlement_in_progress(msg: impl Into<String>) -> Self {
+        Self::with_code(
+            msg,
+            "settlement-in-progress",
+            "Settlement Already In Progress",
+            "tag:paymentauth.org,2024:settlement-in-progress",
+        )
+        .retryable()
     }
 
     /// Return an RFC 9457 Problem Details JSON object.
@@ -5292,9 +5458,9 @@ mod tests {
     }
 
     #[test]
-    fn charge_with_options_rejects_zero_split_amount() {
+    fn charge_with_options_preserves_zero_split_amount() {
         let mpp = test_mpp();
-        let err = mpp
+        let challenge = mpp
             .charge_with_options(
                 "1.00",
                 ChargeOptions {
@@ -5302,29 +5468,33 @@ mod tests {
                     ..Default::default()
                 },
             )
-            .err()
-            .expect("zero split amount should be rejected");
-        assert!(format!("{err}").contains("greater than zero"), "got: {err}");
+            .expect("zero-value split should be preserved");
+        let request: ChargeRequest = challenge.request.decode().unwrap();
+        assert_eq!(request.method_details.unwrap()["splits"][0]["amount"], "0");
     }
 
     #[test]
-    fn charge_with_options_rejects_duplicate_split_recipient() {
+    fn charge_with_options_preserves_duplicate_split_recipient_with_distinct_memos() {
         let mpp = test_mpp();
         let dup = Pubkey::new_unique().to_string();
-        let err = mpp
+        let mut platform_fee = split_helper(&dup, "100");
+        platform_fee.memo = Some("platform fee".to_string());
+        let mut referral = split_helper(&dup, "200");
+        referral.memo = Some("referral".to_string());
+        let challenge = mpp
             .charge_with_options(
                 "1.00",
                 ChargeOptions {
-                    splits: vec![split_helper(&dup, "100"), split_helper(&dup, "200")],
+                    splits: vec![platform_fee, referral],
                     ..Default::default()
                 },
             )
-            .err()
-            .expect("duplicate split recipient should be rejected");
-        assert!(
-            format!("{err}").contains("duplicate recipient"),
-            "got: {err}"
-        );
+            .expect("duplicate-recipient legs should be preserved");
+        let request: ChargeRequest = challenge.request.decode().unwrap();
+        let splits = &request.method_details.unwrap()["splits"];
+        assert_eq!(splits.as_array().unwrap().len(), 2);
+        assert_eq!(splits[0]["recipient"], dup);
+        assert_eq!(splits[1]["recipient"], dup);
     }
 
     #[test]
@@ -6568,6 +6738,204 @@ mod tests {
         // The reservation is durable: a later attempt still loses.
         let after = mpp.consume_signature(signature).await;
         assert_eq!(after.unwrap_err().code, Some("signature-consumed"));
+    }
+
+    // ── Idempotent replay wired into verify() ──
+    //
+    // These pre-seed the challenge-scoped `ChargeReplayStore` directly
+    // (rather than driving a real broadcast, which needs live RPC) to prove
+    // `verify` consults it BEFORE attempting settlement. Both tests use a
+    // deliberately unparseable push-mode signature ("not-a-real-signature");
+    // if the short-circuit did not fire, settlement would attempt
+    // `Signature::from_str` on it and fail with a *different*, clearly
+    // distinguishable error, so the test is self-validating.
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn verify_identical_retry_after_confirmation_rejects_without_resettling() {
+        let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
+        let mpp = Mpp::new(Config {
+            recipient: TEST_RECIPIENT.to_string(),
+            challenge_binding_secret: Some(TEST_SECRET.to_string()),
+            store: Some(store.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let challenge = mpp.charge("0.10").unwrap();
+        let cred = PaymentCredential {
+            challenge: challenge.to_echo(),
+            source: None,
+            payload: serde_json::json!({"type": "signature", "signature": "not-a-real-signature"}),
+        };
+        let expected: ChargeRequest = challenge.request.decode().unwrap();
+
+        // Pre-seed the idempotency record as if an earlier presentation of
+        // this exact credential had already confirmed on-chain — the
+        // response-loss scenario: the first HTTP response never reached the
+        // client, but the settlement itself already happened.
+        let payload: CredentialPayload = serde_json::from_value(cred.payload.clone()).unwrap();
+        let digest =
+            normalized_request_digest(&cred.challenge.id, cred.challenge.request.raw(), &payload)
+                .unwrap();
+        let replay_store = ChargeReplayStore::new(store.clone());
+        replay_store
+            .reserve(&cred.challenge.id, &digest, CHARGE_RESERVATION_LEASE)
+            .await
+            .unwrap();
+        replay_store
+            .mark_confirmed(&cred.challenge.id, "already-settled-signature")
+            .await
+            .unwrap();
+
+        // The retry must reject with the canonical signature-consumed code,
+        // referencing the pre-confirmed signature, without attempting real
+        // settlement.
+        let err = mpp
+            .verify_credential_with_expected(&cred, &expected)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, Some("signature-consumed"));
+        assert!(
+            err.message.contains("already-settled-signature"),
+            "reject message should reference the already-settled signature, got: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn verify_conflicting_retry_under_same_challenge_id_is_rejected() {
+        let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
+        let mpp = Mpp::new(Config {
+            recipient: TEST_RECIPIENT.to_string(),
+            challenge_binding_secret: Some(TEST_SECRET.to_string()),
+            store: Some(store.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let challenge = mpp.charge("0.10").unwrap();
+        let cred = PaymentCredential {
+            challenge: challenge.to_echo(),
+            source: None,
+            payload: serde_json::json!({"type": "signature", "signature": "not-a-real-signature"}),
+        };
+        let expected: ChargeRequest = challenge.request.decode().unwrap();
+
+        // Pre-seed a CONFIRMED record for a DIFFERENT digest under the same
+        // challenge id — simulating an earlier, different credential having
+        // already settled this exact challenge.
+        let replay_store = ChargeReplayStore::new(store.clone());
+        replay_store
+            .reserve(
+                &cred.challenge.id,
+                "some-other-digest",
+                CHARGE_RESERVATION_LEASE,
+            )
+            .await
+            .unwrap();
+        replay_store
+            .mark_confirmed(&cred.challenge.id, "other-signature")
+            .await
+            .unwrap();
+
+        let err = mpp
+            .verify_credential_with_expected(&cred, &expected)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, Some("challenge-conflict"));
+    }
+
+    #[test]
+    fn normalized_request_digest_is_deterministic_and_input_sensitive() {
+        let encoded_request = "encoded-request-a";
+        let payload = CredentialPayload::Signature {
+            signature: "sig-a".to_string(),
+        };
+
+        let d1 = normalized_request_digest("chal-1", encoded_request, &payload).unwrap();
+        let d2 = normalized_request_digest("chal-1", encoded_request, &payload).unwrap();
+        assert_eq!(d1, d2, "same inputs must hash identically");
+
+        let d3 = normalized_request_digest("chal-2", encoded_request, &payload).unwrap();
+        assert_ne!(d1, d3, "a different challenge id must change the digest");
+
+        let other_payload = CredentialPayload::Signature {
+            signature: "sig-b".to_string(),
+        };
+        let d4 = normalized_request_digest("chal-1", encoded_request, &other_payload).unwrap();
+        assert_ne!(
+            d1, d4,
+            "a different credential payload must change the digest"
+        );
+
+        let d5 = normalized_request_digest("chal-1", "encoded-request-b", &payload).unwrap();
+        assert_ne!(d1, d5, "a different encoded request must change the digest");
+    }
+
+    // Regression test for the bug this fix closes: a route handler that
+    // reconstructs its `expected` `ChargeRequest` fresh on every call (e.g.
+    // `charge_with_options` embedding a freshly pre-fetched blockhash in
+    // `methodDetails`) must not make an identical credential resubmit hash
+    // to a different digest just because the caller-supplied `expected`
+    // drifted between the two calls.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn verify_identical_retry_is_stable_even_when_callers_expected_request_drifts() {
+        let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
+        let mpp = Mpp::new(Config {
+            recipient: TEST_RECIPIENT.to_string(),
+            challenge_binding_secret: Some(TEST_SECRET.to_string()),
+            store: Some(store.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let challenge = mpp.charge("0.10").unwrap();
+        let cred = PaymentCredential {
+            challenge: challenge.to_echo(),
+            source: None,
+            payload: serde_json::json!({"type": "signature", "signature": "not-a-real-signature"}),
+        };
+        let payload: CredentialPayload = serde_json::from_value(cred.payload.clone()).unwrap();
+        let digest =
+            normalized_request_digest(&cred.challenge.id, cred.challenge.request.raw(), &payload)
+                .unwrap();
+
+        // Pre-seed as if an earlier call already confirmed this credential
+        // on-chain.
+        let replay_store = ChargeReplayStore::new(store.clone());
+        replay_store
+            .reserve(&cred.challenge.id, &digest, CHARGE_RESERVATION_LEASE)
+            .await
+            .unwrap();
+        replay_store
+            .mark_confirmed(&cred.challenge.id, "already-settled-signature")
+            .await
+            .unwrap();
+
+        // A route handler that reconstructs `expected` fresh per call (e.g.
+        // re-deriving a challenge via `charge_with_options`, whose method
+        // details embed a freshly pre-fetched blockhash) can legitimately
+        // hand `verify_credential_with_expected` an `expected` that differs
+        // from the one used on the original call — `compare_expected_to_request`
+        // doesn't check `methodDetails.blockhash` for exactly this reason.
+        // The retry must still be recognized as the same settlement attempt.
+        let mut expected: ChargeRequest = challenge.request.decode().unwrap();
+        let mut details = expected
+            .method_details
+            .clone()
+            .unwrap_or_else(|| serde_json::json!({}));
+        details["blockhash"] = serde_json::json!("a-different-blockhash-than-original-issuance");
+        expected.method_details = Some(details);
+
+        let err = mpp
+            .verify_credential_with_expected(&cred, &expected)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code,
+            Some("signature-consumed"),
+            "a drifted `expected` must not turn an identical retry into a false conflict"
+        );
     }
 
     // ── Receipt tests ──

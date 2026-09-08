@@ -339,7 +339,13 @@ async fn sol_charge_wrong_recipient_rejected_before_broadcast() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
-async fn sol_charge_replay_rejected() {
+async fn sol_charge_identical_retry_is_rejected() {
+    // Ed25519 signing is deterministic, so replaying an already-signed
+    // pull-mode credential reproduces the exact same on-chain signature.
+    // The challenge-scoped `ChargeReplayStore` recognizes that before
+    // `consume_signature` would otherwise surface a bare internal error,
+    // and rejects it with the canonical `signature_consumed` code instead —
+    // the same reject TypeScript and Ruby emit for a resettled credential.
     let recipient = Keypair::new();
     let Some(surfnet) = start_surfnet_or_skip().await else {
         return;
@@ -369,7 +375,6 @@ async fn sol_charge_replay_rejected() {
         .await
         .unwrap();
 
-    // First: success.
     let expected = expected_charge(
         "1000000",
         "SOL",
@@ -378,30 +383,31 @@ async fn sol_charge_replay_rejected() {
         9,
         None,
     );
-    let receipt = mpp
+
+    // First presentation: settles on-chain.
+    let first = mpp
         .verify_credential_with_expected(
             &solana_pay_kit::mpp::parse_authorization(&auth).unwrap(),
             &expected,
         )
         .await
         .unwrap();
-    assert_eq!(receipt.status.to_string(), "success");
+    assert_eq!(first.status.to_string(), "success");
 
-    // Replay: rejected — either by the replay store (signature-consumed)
-    // or by the network itself (duplicate transaction).
-    let err = mpp
+    // Identical retry — must reject with the canonical signature-consumed
+    // code, not silently re-settle or succeed a second time.
+    let second_err = mpp
         .verify_credential_with_expected(
             &solana_pay_kit::mpp::parse_authorization(&auth).unwrap(),
             &expected,
         )
         .await
         .unwrap_err();
+    assert_eq!(second_err.code, Some("signature-consumed"));
     assert!(
-        err.message.contains("consumed")
-            || err.message.contains("already been processed")
-            || err.code == Some("signature-consumed"),
-        "Expected replay rejection, got: {}",
-        err.message
+        second_err.message.contains(&first.reference),
+        "reject message should reference the already-settled signature, got: {}",
+        second_err.message
     );
 }
 

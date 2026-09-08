@@ -18,6 +18,7 @@ use solana_hash::Hash;
 use solana_instruction::AccountMeta;
 use solana_instruction::Instruction;
 use solana_keychain::SolanaSigner;
+use solana_message::compiled_instruction::CompiledInstruction;
 use solana_message::Message;
 use solana_pubkey::Pubkey;
 use solana_transaction::versioned::VersionedTransaction;
@@ -45,6 +46,46 @@ pub const SYSTEM_PROGRAM: &str = "11111111111111111111111111111111";
 
 /// Default payment-channel close grace period, in seconds.
 pub const DEFAULT_GRACE_PERIOD_SECONDS: u32 = 900;
+
+/// Compute Budget program ID.
+pub const COMPUTE_BUDGET_PROGRAM: &str = "ComputeBudget111111111111111111111111111111";
+
+/// SPL Memo program ID.
+pub const MEMO_PROGRAM: &str = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr";
+
+/// Phantom/Solflare Lighthouse program ID. Both wallets inject assertion
+/// instructions after the instructions a dapp asked them to sign, so an `open`
+/// signed through them arrives with a Lighthouse suffix the verifier must
+/// tolerate rather than treat as a smuggled instruction.
+pub const LIGHTHOUSE_PROGRAM: &str = "L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95";
+
+/// `SetComputeUnitLimit` instruction type byte in Compute Budget data.
+pub const COMPUTE_BUDGET_SET_UNIT_LIMIT: u8 = 2;
+
+/// `SetComputeUnitPrice` instruction type byte in Compute Budget data.
+pub const COMPUTE_BUDGET_SET_UNIT_PRICE: u8 = 3;
+
+/// Ceiling on `SetComputeUnitLimit` in a channel-`open` transaction. An
+/// observed open consumes ~51,000 CU; the ceiling is the runtime's own
+/// per-transaction reservation for the open + memo pair.
+pub const OPEN_MAX_COMPUTE_UNIT_LIMIT: u32 = 400_000;
+
+/// Ceiling on `SetComputeUnitPrice` in a channel-`open` transaction. The
+/// operator is the fee payer, so the payer picks a priority fee the operator
+/// pays; 5,000,000 microlamports (5 lamports/CU) is the spec ceiling.
+pub const MAX_COMPUTE_UNIT_PRICE_MICROLAMPORTS: u64 = 5_000_000;
+
+/// Maximum Lighthouse assertion instructions accepted after `open`.
+pub const OPEN_MAX_LIGHTHOUSE_INSTRUCTIONS: usize = 3;
+
+/// Maximum optional instructions accepted after `open` (3 Lighthouse + 1 Memo).
+pub const OPEN_MAX_OPTIONAL_SUFFIX: usize = 4;
+
+/// Maximum byte length of a memo emitted after `open`. Narrower than the SPL
+/// Memo program's own limit: it is the cap the canonical x402 client enforces
+/// on `extra.memo`, so a longer memo would be built here only to be rejected
+/// by the counterparty.
+pub const OPEN_MAX_MEMO_BYTES: usize = 256;
 
 /// Constant magic prefix of the signed voucher payload (`[0x56, 0x01]`).
 ///
@@ -88,14 +129,43 @@ pub const INSTRUCTIONS_SYSVAR_ID: &str = "Sysvar1nstructions11111111111111111111
 /// Rent sysvar ID.
 pub const RENT_SYSVAR_ID: &str = "SysvarRent111111111111111111111111111111111";
 
-/// Treasury owner used by the current payment-channels program deployment.
-// Cs2zdfUNonRdRGsiZUQQLdTxzxVvJZmgiX2mpLYKuEqP — the treasury owner baked into
-// the deployed (mainnet-build) payment-channels program; `distribute` checks the
-// treasury ATA against ATA(TREASURY_OWNER, mint, token_program).
+/// Treasury owner baked into the mainnet-build payment-channels program.
+// Cs2zdfUNonRdRGsiZUQQLdTxzxVvJZmgiX2mpLYKuEqP — `distribute` checks the
+// treasury ATA against ATA(TREASURY_OWNER, mint, token_program), so this must
+// match the constant the target deployment was built with exactly, or
+// `distribute` fails with `TreasuryAccountMismatch`. The devnet build was
+// deployed with a different constant — see [`treasury_owner_for_cluster`].
 pub const TREASURY_OWNER: [u8; 32] = [
     0xB0, 0x41, 0xD9, 0xD3, 0x37, 0xB7, 0x21, 0xBE, 0x57, 0x89, 0x4E, 0xB6, 0x9C, 0x3B, 0x68, 0x09,
     0xA5, 0x3A, 0x0E, 0x2B, 0x6A, 0x23, 0x99, 0xFC, 0x7D, 0x5B, 0x7E, 0xDA, 0x8C, 0xAC, 0x89, 0xAA,
 ];
+
+/// Treasury owner baked into the devnet-build payment-channels program
+/// (4zTeC5mVqWLruDexgU2mV66p9t5vCA9JyiZqdGDUspap) — distinct from the
+/// mainnet build's constant. Mirrors the TypeScript SDK's
+/// `DEVNET_TREASURY_OWNER` (mechanisms/svm/src/payment-channels/onchain.ts).
+pub const DEVNET_TREASURY_OWNER: [u8; 32] = [
+    0x3B, 0x4B, 0x4A, 0x4C, 0x3E, 0xCD, 0x7E, 0x59, 0xD6, 0x34, 0xAE, 0x67, 0xE5, 0xDE, 0xBB, 0xEC,
+    0x0A, 0xD0, 0x6F, 0x20, 0x4D, 0xF0, 0x13, 0xA6, 0x95, 0xA3, 0x37, 0x6A, 0x57, 0xB9, 0x8D, 0x05,
+];
+
+/// Basis points denominating a distribution share; 10,000 is the whole amount.
+pub const FULL_SHARE_BPS: u16 = 10_000;
+
+/// The single-recipient distribution both channel schemes commit at `open`.
+///
+/// `upto` and `batch-settlement` each send 100% of settled funds to one
+/// address, leaving the channel `payee` with a zero implicit remainder. The
+/// program hashes this list into `distribution_hash` at `open` and re-checks it
+/// at `distribute`, so the preimage has to be rebuilt identically at every site
+/// that opens, verifies, or pays out a channel — which is exactly why it is
+/// built here rather than spelled out at each one.
+pub fn sole_recipient(recipient: &Pubkey) -> Vec<Distribution> {
+    vec![Distribution {
+        recipient: *recipient,
+        bps: FULL_SHARE_BPS,
+    }]
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Distribution {
@@ -168,6 +238,18 @@ pub fn instructions_sysvar_id() -> Pubkey {
     Pubkey::from_str(INSTRUCTIONS_SYSVAR_ID).expect("valid instructions sysvar id")
 }
 
+pub fn compute_budget_program_id() -> Pubkey {
+    Pubkey::from_str(COMPUTE_BUDGET_PROGRAM).expect("valid compute budget program id")
+}
+
+pub fn memo_program_id() -> Pubkey {
+    Pubkey::from_str(MEMO_PROGRAM).expect("valid memo program id")
+}
+
+pub fn lighthouse_program_id() -> Pubkey {
+    Pubkey::from_str(LIGHTHOUSE_PROGRAM).expect("valid lighthouse program id")
+}
+
 pub fn rent_sysvar_id() -> Pubkey {
     Pubkey::from_str(RENT_SYSVAR_ID).expect("valid rent sysvar id")
 }
@@ -176,12 +258,28 @@ pub fn treasury_owner() -> Pubkey {
     Pubkey::from(TREASURY_OWNER)
 }
 
+/// Treasury owner for the payment-channels program deployment on `cluster`.
+///
+/// Each network's program binary is built with its own baked-in
+/// `TREASURY_OWNER`; `distribute` validates the treasury ATA against it, so
+/// callers settling on devnet must use [`DEVNET_TREASURY_OWNER`] or every
+/// `distribute` fails with `TreasuryAccountMismatch` (0x961). Mirrors the
+/// TypeScript SDK's `getPaymentChannelsTreasuryOwner` matching rule.
+pub fn treasury_owner_for_cluster(cluster: &str) -> Pubkey {
+    match cluster {
+        "devnet" | "solana-devnet" | "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1" => {
+            Pubkey::from(DEVNET_TREASURY_OWNER)
+        }
+        _ => Pubkey::from(TREASURY_OWNER),
+    }
+}
+
 pub fn parse_pubkey(value: &str) -> Result<Pubkey> {
     Pubkey::from_str(value).map_err(|e| Error::Other(format!("invalid pubkey {value}: {e}")))
 }
 
 pub fn pubkey_string(pubkey: &Pubkey) -> String {
-    bs58::encode(pubkey.as_ref()).into_string()
+    crate::core::base58::encode_32(&pubkey.to_bytes())
 }
 
 pub fn to_address(pubkey: &Pubkey) -> Address {
@@ -594,6 +692,20 @@ pub fn build_distribute_instruction(
     ix
 }
 
+/// Optional instructions wrapping the `open` in the built transaction.
+///
+/// The default is a bare `open`: every pay-kit server accepts it, and adding
+/// instructions a counterparty's verifier does not expect turns a valid payment
+/// into a rejected one. Only set a field when the challenge asks for it.
+#[derive(Debug, Clone, Default)]
+pub struct OpenTxOptions {
+    /// Seller-declared memo (`extra.memo`), emitted as one SPL Memo
+    /// instruction after `open`. The x402 `upto` facilitator that declares it
+    /// requires exactly one matching Memo, so the text is passed through
+    /// verbatim.
+    pub memo: Option<String>,
+}
+
 /// Build a payer-signed (fee-payer-unsigned) channel `open` transaction.
 ///
 /// The `payer` (the `signer`) signs to authorize the deposit; `fee_payer` is the
@@ -617,6 +729,44 @@ pub async fn build_open_payment_channel_tx(
     fee_payer: &Pubkey,
     recent_blockhash: Hash,
 ) -> Result<PaymentChannelOpenTransaction> {
+    build_open_payment_channel_tx_with_options(
+        signer,
+        payee,
+        mint,
+        authorized_signer,
+        salt,
+        open_slot,
+        deposit,
+        grace_period,
+        recipients,
+        token_program,
+        program_id,
+        fee_payer,
+        recent_blockhash,
+        &OpenTxOptions::default(),
+    )
+    .await
+}
+
+/// [`build_open_payment_channel_tx`] with the optional wrapper instructions in
+/// [`OpenTxOptions`] appended after `open`.
+#[allow(clippy::too_many_arguments)]
+pub async fn build_open_payment_channel_tx_with_options(
+    signer: &dyn SolanaSigner,
+    payee: &Pubkey,
+    mint: &Pubkey,
+    authorized_signer: &Pubkey,
+    salt: u64,
+    open_slot: u64,
+    deposit: u64,
+    grace_period: u32,
+    recipients: Vec<Distribution>,
+    token_program: &Pubkey,
+    program_id: &Pubkey,
+    fee_payer: &Pubkey,
+    recent_blockhash: Hash,
+    options: &OpenTxOptions,
+) -> Result<PaymentChannelOpenTransaction> {
     let params = OpenChannelParams {
         payer: signer.pubkey(),
         // rentPayer is pinned to the operator / fee payer already in scope.
@@ -633,8 +783,21 @@ pub async fn build_open_payment_channel_tx(
         program_id: *program_id,
     };
     let channel_id = derive_channel_addresses(&params).channel;
-    let ix = build_open_instruction(&params);
-    let message = Message::new_with_blockhash(&[ix], Some(fee_payer), &recent_blockhash);
+    let mut instructions = vec![build_open_instruction(&params)];
+    if let Some(memo) = options.memo.as_deref() {
+        if memo.len() > OPEN_MAX_MEMO_BYTES {
+            return Err(Error::Other(format!(
+                "channel open memo is {} bytes, over the {OPEN_MAX_MEMO_BYTES}-byte maximum",
+                memo.len()
+            )));
+        }
+        instructions.push(Instruction {
+            program_id: memo_program_id(),
+            accounts: vec![],
+            data: memo.as_bytes().to_vec(),
+        });
+    }
+    let message = Message::new_with_blockhash(&instructions, Some(fee_payer), &recent_blockhash);
     let mut tx = Transaction::new_unsigned(message);
 
     signer
@@ -650,6 +813,284 @@ pub async fn build_open_payment_channel_tx(
         transaction: base64::engine::general_purpose::STANDARD.encode(bytes),
     })
 }
+
+// ── Client-supplied transaction acceptance policy ──
+//
+// A sponsor co-signs a transaction the *client* built, so its signature can
+// only be safely given to a transaction whose every top-level instruction is
+// on a static allowlist. [`scan_channel_tx_layout`] is that allowlist check,
+// shared by the x402 `upto` and `batch-settlement` sponsors: an optional
+// ComputeBudget prefix, exactly one canonical payment-channels instruction,
+// then a bounded Memo/Lighthouse suffix. Simulation is not a substitute — it
+// runs only after the signature has already authorized fee (and, for `open`,
+// rent) expenditure.
+
+/// A decoded ComputeBudget instruction the sponsor policy permits: a unit
+/// limit or a unit price.
+///
+/// The on-chain wire format (tag [`COMPUTE_BUDGET_SET_UNIT_LIMIT`], 5 bytes,
+/// `u32`; tag [`COMPUTE_BUDGET_SET_UNIT_PRICE`], 9 bytes, `u64`) is the same
+/// everywhere, so it is decoded once here. Callers apply their own caps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComputeBudgetOp {
+    /// `SetComputeUnitLimit(units)`.
+    UnitLimit(u32),
+    /// `SetComputeUnitPrice(microLamportsPerComputeUnit)`.
+    UnitPrice(u64),
+}
+
+/// Decode a `SetComputeUnitLimit` / `SetComputeUnitPrice` ComputeBudget
+/// instruction. Returns `None` for any other opcode or a malformed length —
+/// callers decide whether that is an error and how to report it.
+pub fn decode_compute_budget_op(ix: &CompiledInstruction) -> Option<ComputeBudgetOp> {
+    match (ix.data.first().copied(), ix.data.len()) {
+        (Some(COMPUTE_BUDGET_SET_UNIT_LIMIT), 5) => Some(ComputeBudgetOp::UnitLimit(
+            u32::from_le_bytes(ix.data[1..5].try_into().expect("4-byte slice")),
+        )),
+        (Some(COMPUTE_BUDGET_SET_UNIT_PRICE), 9) => Some(ComputeBudgetOp::UnitPrice(
+            u64::from_le_bytes(ix.data[1..9].try_into().expect("8-byte slice")),
+        )),
+        _ => None,
+    }
+}
+
+/// Minimum length of a random Memo nonce, in bytes, before hex encoding.
+///
+/// SVM `batch-settlement` requires the setup transaction to carry a Memo so the
+/// sponsor can correlate it; absent a seller-declared `extra.memo` the client
+/// supplies "a random nonce of at least 16 bytes encoded as hexadecimal text".
+pub const MIN_MEMO_NONCE_BYTES: usize = 16;
+
+/// How [`scan_channel_tx_layout`] polices the Memo suffix.
+#[derive(Debug, Clone, Copy)]
+pub enum MemoPolicy<'a> {
+    /// A Memo may appear at most once and its contents are not inspected.
+    ///
+    /// Used by `upto`, whose server never declares `extra.memo`, so any memo
+    /// the client chose is acceptable.
+    Optional,
+    /// Exactly one Memo is required.
+    ///
+    /// `Some(memo)` pins its UTF-8 data to the seller-declared `extra.memo`;
+    /// `None` instead requires a random nonce of at least
+    /// [`MIN_MEMO_NONCE_BYTES`] bytes encoded as hexadecimal text.
+    Required(Option<&'a str>),
+}
+
+/// Enforce the sponsor's top-level instruction allowlist and return the single
+/// canonical payment-channels instruction it wraps.
+///
+/// The accepted layout is exactly three ordered regions:
+///
+/// 1. An optional ComputeBudget prefix: at most one `SetComputeUnitLimit` and
+///    at most one `SetComputeUnitPrice`, limit before price, each within
+///    [`OPEN_MAX_COMPUTE_UNIT_LIMIT`] / [`MAX_COMPUTE_UNIT_PRICE_MICROLAMPORTS`].
+/// 2. Exactly one instruction on `program_id` whose first data byte is
+///    `discriminator`.
+/// 3. A suffix of at most [`OPEN_MAX_LIGHTHOUSE_INSTRUCTIONS`] Lighthouse
+///    assertions plus a Memo governed by `memo`, capped at
+///    [`OPEN_MAX_OPTIONAL_SUFFIX`] instructions in total.
+///
+/// No wrapper instruction may name the transaction fee payer among its
+/// accounts: outside the payment-channels instruction's own prescribed roles
+/// the sponsor's signature must authorize network fees and nothing else.
+///
+/// `label` names the operation in error messages (`"open"`, `"top_up"`, …).
+pub fn scan_channel_tx_layout<'tx>(
+    tx: &'tx VersionedTransaction,
+    keys: &[Pubkey],
+    program_id: &Pubkey,
+    discriminator: u8,
+    label: &str,
+    memo: MemoPolicy<'_>,
+) -> Result<&'tx CompiledInstruction> {
+    let instructions = tx.message.instructions();
+    let fee_payer = *keys
+        .first()
+        .ok_or_else(|| Error::Other(format!("{label} transaction has no fee payer")))?;
+    let program_of = |ix: &CompiledInstruction| -> Result<Pubkey> {
+        keys.get(ix.program_id_index as usize)
+            .copied()
+            .ok_or_else(|| Error::Other(format!("{label} instruction program id out of range")))
+    };
+    let reject_fee_payer = |ix: &CompiledInstruction, wrapper: &str| -> Result<()> {
+        if ix
+            .accounts
+            .iter()
+            .any(|&i| keys.get(i as usize) == Some(&fee_payer))
+        {
+            return Err(Error::Other(format!(
+                "{wrapper} instruction must not reference the fee payer"
+            )));
+        }
+        Ok(())
+    };
+
+    let compute_budget = compute_budget_program_id();
+    let mut index = 0usize;
+    let (mut seen_limit, mut seen_price) = (false, false);
+    while let Some(ix) = instructions.get(index) {
+        if program_of(ix)? != compute_budget {
+            break;
+        }
+        reject_fee_payer(ix, "ComputeBudget")?;
+        match decode_compute_budget_op(ix) {
+            Some(ComputeBudgetOp::UnitLimit(units)) => {
+                if seen_limit {
+                    return Err(Error::Other(format!(
+                        "{label} transaction has a duplicate SetComputeUnitLimit instruction"
+                    )));
+                }
+                if seen_price {
+                    return Err(Error::Other(format!(
+                        "{label} transaction SetComputeUnitLimit must precede SetComputeUnitPrice"
+                    )));
+                }
+                if units > OPEN_MAX_COMPUTE_UNIT_LIMIT {
+                    return Err(Error::Other(format!(
+                        "{label} transaction compute unit limit {units} exceeds maximum {OPEN_MAX_COMPUTE_UNIT_LIMIT}"
+                    )));
+                }
+                seen_limit = true;
+            }
+            Some(ComputeBudgetOp::UnitPrice(price)) => {
+                if seen_price {
+                    return Err(Error::Other(format!(
+                        "{label} transaction has a duplicate SetComputeUnitPrice instruction"
+                    )));
+                }
+                if price > MAX_COMPUTE_UNIT_PRICE_MICROLAMPORTS {
+                    return Err(Error::Other(format!(
+                        "{label} transaction compute unit price {price} exceeds maximum {MAX_COMPUTE_UNIT_PRICE_MICROLAMPORTS}"
+                    )));
+                }
+                seen_price = true;
+            }
+            None => {
+                return Err(Error::Other(format!(
+                    "{label} transaction has an unsupported ComputeBudget instruction"
+                )))
+            }
+        }
+        index += 1;
+    }
+
+    let primary = instructions.get(index).ok_or_else(|| {
+        Error::Other(format!(
+            "{label} transaction contains no payment-channels instruction"
+        ))
+    })?;
+    if program_of(primary)? != *program_id {
+        return Err(Error::Other(format!(
+            "{label} transaction targets an unexpected program"
+        )));
+    }
+    if primary.data.first() != Some(&discriminator) {
+        return Err(Error::Other(format!(
+            "{label} transaction is not a payment-channels {label} instruction"
+        )));
+    }
+    index += 1;
+
+    let memo_program = memo_program_id();
+    let lighthouse = lighthouse_program_id();
+    let (mut lighthouse_count, mut optional_count, mut memo_count) = (0usize, 0usize, 0usize);
+    while let Some(ix) = instructions.get(index) {
+        optional_count += 1;
+        if optional_count > OPEN_MAX_OPTIONAL_SUFFIX {
+            return Err(Error::Other(format!(
+                "{label} transaction allows at most {OPEN_MAX_OPTIONAL_SUFFIX} instructions after {label}"
+            )));
+        }
+        let program = program_of(ix)?;
+        if program == lighthouse {
+            lighthouse_count += 1;
+            if lighthouse_count > OPEN_MAX_LIGHTHOUSE_INSTRUCTIONS {
+                return Err(Error::Other(format!(
+                    "{label} transaction allows at most {OPEN_MAX_LIGHTHOUSE_INSTRUCTIONS} Lighthouse instructions after {label}"
+                )));
+            }
+            reject_fee_payer(ix, "Lighthouse")?;
+        } else if program == memo_program {
+            memo_count += 1;
+            if memo_count > 1 {
+                return Err(Error::Other(format!(
+                    "{label} transaction allows at most one Memo instruction"
+                )));
+            }
+            reject_fee_payer(ix, "Memo")?;
+            check_memo_data(&ix.data, label, memo)?;
+        } else {
+            return Err(Error::Other(format!(
+                "{label} transaction instruction after {label} must be Lighthouse or Memo, found {}",
+                pubkey_string(&program)
+            )));
+        }
+        index += 1;
+    }
+    if memo_count == 0 && matches!(memo, MemoPolicy::Required(_)) {
+        return Err(Error::Other(format!(
+            "{label} transaction must carry exactly one Memo instruction"
+        )));
+    }
+
+    Ok(primary)
+}
+
+/// Apply a [`MemoPolicy`] to one Memo instruction's data.
+fn check_memo_data(data: &[u8], label: &str, memo: MemoPolicy<'_>) -> Result<()> {
+    let MemoPolicy::Required(expected) = memo else {
+        return Ok(());
+    };
+    if data.len() > OPEN_MAX_MEMO_BYTES {
+        return Err(Error::Other(format!(
+            "{label} transaction memo is {} bytes, over the {OPEN_MAX_MEMO_BYTES}-byte maximum",
+            data.len()
+        )));
+    }
+    let text = std::str::from_utf8(data)
+        .map_err(|_| Error::Other(format!("{label} transaction memo is not valid UTF-8")))?;
+    match expected {
+        Some(expected) => {
+            if text != expected {
+                return Err(Error::Other(format!(
+                    "{label} transaction memo does not match the declared extra.memo"
+                )));
+            }
+        }
+        // No seller-declared memo: the client must supply a random hex nonce,
+        // which correlates the transaction without letting it carry a payload
+        // the sponsor never agreed to.
+        None => {
+            if text.len() < MIN_MEMO_NONCE_BYTES * 2 || !text.bytes().all(|b| b.is_ascii_hexdigit())
+            {
+                return Err(Error::Other(format!(
+                    "{label} transaction memo must be a hex nonce of at least {MIN_MEMO_NONCE_BYTES} bytes"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Fixed byte length of the payment-channels channel account layout this SDK
+/// targets. `getProgramAccounts` discovery filters on it, and a different
+/// length means an unsupported account version whose field offsets below no
+/// longer hold.
+pub const CHANNEL_ACCOUNT_SIZE: usize = 256;
+
+/// `Channel.payer` byte offset — a client discovers its own channels here.
+pub const CHANNEL_PAYER_OFFSET: usize = 88;
+
+/// `Channel.payee` byte offset — the lifecycle authority seat.
+pub const CHANNEL_PAYEE_OFFSET: usize = 120;
+
+/// `Channel.authorized_signer` byte offset — the voucher signer.
+pub const CHANNEL_AUTHORIZED_SIGNER_OFFSET: usize = 152;
+
+/// `Channel.rent_payer` byte offset — a sponsor discovers the channels whose
+/// rent it fronted here.
+pub const CHANNEL_RENT_PAYER_OFFSET: usize = 216;
 
 #[cfg(test)]
 mod tests {
@@ -723,5 +1164,108 @@ mod tests {
         let (a, _) = find_channel_pda(&pk(1), &pk(2), &pk(3), &pk(4), 99, 100, &program_id);
         let (b, _) = find_channel_pda(&pk(1), &pk(2), &pk(3), &pk(4), 99, 101, &program_id);
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn well_known_program_ids_parse() {
+        // Each id is parsed from a literal, so a typo would only surface as a
+        // panic at first use — in the middle of building or verifying an open.
+        assert_eq!(
+            pubkey_string(&compute_budget_program_id()),
+            COMPUTE_BUDGET_PROGRAM
+        );
+        assert_eq!(pubkey_string(&memo_program_id()), MEMO_PROGRAM);
+        assert_eq!(pubkey_string(&lighthouse_program_id()), LIGHTHOUSE_PROGRAM);
+        assert_eq!(pubkey_string(&system_program_id()), SYSTEM_PROGRAM);
+        assert_eq!(
+            pubkey_string(&associated_token_program_id()),
+            ASSOCIATED_TOKEN_PROGRAM
+        );
+        assert_eq!(pubkey_string(&rent_sysvar_id()), RENT_SYSVAR_ID);
+        assert_eq!(
+            pubkey_string(&instructions_sysvar_id()),
+            INSTRUCTIONS_SYSVAR_ID
+        );
+        assert_eq!(
+            pubkey_string(&treasury_owner()),
+            "Cs2zdfUNonRdRGsiZUQQLdTxzxVvJZmgiX2mpLYKuEqP"
+        );
+        assert!(parse_pubkey("not-a-pubkey").is_err());
+    }
+
+    #[test]
+    fn open_tx_options_default_to_a_bare_open() {
+        // The default must stay memo-free: every pay-kit server accepts a bare
+        // open, so wrapping instructions are opt-in per challenge.
+        let options = OpenTxOptions::default();
+        assert!(options.memo.is_none());
+        assert!(options.clone().memo.is_none());
+        assert!(format!("{options:?}").contains("memo"));
+    }
+
+    fn test_signer() -> Box<dyn SolanaSigner> {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let mut kp = [0u8; 64];
+        kp[..32].copy_from_slice(sk.as_bytes());
+        kp[32..].copy_from_slice(sk.verifying_key().as_bytes());
+        Box::new(solana_keychain::MemorySigner::from_bytes(&kp).expect("valid keypair"))
+    }
+
+    async fn build_open(options: &OpenTxOptions) -> Result<PaymentChannelOpenTransaction> {
+        let signer = test_signer();
+        build_open_payment_channel_tx_with_options(
+            &*signer,
+            &pk(2),
+            &pk(3),
+            &pk(4),
+            99,
+            314,
+            1_000_000,
+            DEFAULT_GRACE_PERIOD_SECONDS,
+            vec![Distribution {
+                recipient: pk(5),
+                bps: 10_000,
+            }],
+            &Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap(),
+            &default_program_id(),
+            &pk(6),
+            Hash::default(),
+            options,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn open_tx_carries_the_memo_only_when_requested() {
+        // The bare open is what every pay-kit server verifies; a declared
+        // `extra.memo` adds exactly one Memo instruction after it.
+        let bare = build_open(&OpenTxOptions::default())
+            .await
+            .expect("bare open transaction");
+        let tx = decode_transaction(&bare.transaction).expect("decodable");
+        assert_eq!(tx.message.instructions().len(), 1);
+        assert_eq!(tx.message.static_account_keys()[0], pk(6));
+
+        let with_memo = build_open(&OpenTxOptions {
+            memo: Some("order-4711".to_string()),
+        })
+        .await
+        .expect("open transaction with a memo");
+        assert_eq!(with_memo.channel_id, bare.channel_id);
+        let tx = decode_transaction(&with_memo.transaction).expect("decodable");
+        let keys = tx.message.static_account_keys();
+        let instructions = tx.message.instructions();
+        assert_eq!(instructions.len(), 2);
+        let memo = &instructions[1];
+        assert_eq!(keys[memo.program_id_index as usize], memo_program_id());
+        assert_eq!(memo.data.as_slice(), b"order-4711");
+
+        // Over the cap the counterparty enforces, so it fails here instead.
+        let err = build_open(&OpenTxOptions {
+            memo: Some("x".repeat(OPEN_MAX_MEMO_BYTES + 1)),
+        })
+        .await
+        .expect_err("an over-long memo must be rejected");
+        assert!(err.to_string().contains("memo"));
     }
 }

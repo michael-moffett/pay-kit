@@ -27,6 +27,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use axum::body::{to_bytes, Body, HttpBody};
 use axum::extract::{FromRequestParts, Request, State};
 use axum::handler::Handler;
 use axum::http::request::Parts;
@@ -39,12 +40,18 @@ use crate::mpp::server::{Config as MppConfig, Mpp};
 use crate::mpp::solana_keychain::SolanaSigner;
 use crate::mpp::{format_receipt, format_www_authenticate, Receipt, ReceiptKind};
 use crate::x402::server::{
-    BatchConfig, Config as X402Config, CurrencyConfig, ExactOptions, UptoConfig, UptoPayout,
-    VerifiedExactPayment, X402BatchSettlement, X402Upto, X402,
+    BatchAccess, BatchConfig, Config as X402Config, CurrencyConfig, ExactOptions, UptoConfig,
+    UptoPayout, VerifiedExactPayment, X402BatchSettlement, X402Upto, X402,
 };
 use crate::x402::{PAYMENT_RESPONSE_HEADER, PAYMENT_SIGNATURE_HEADER, X402_V1_PAYMENT_HEADER};
 
 const PAYMENT_RECEIPT_HEADER: &str = "Payment-Receipt";
+
+/// Marks a response whose authorization was already charged and served.
+const PAYMENT_REPLAY_HEADER: HeaderName = HeaderName::from_static("payment-replay");
+
+/// Avoid turning the channel store into an unbounded response-body cache.
+const MAX_CACHED_RESPONSE_BYTES: u64 = 1024 * 1024;
 
 /// Error returned when a [`PayKit`] can't be built from its config.
 #[derive(Debug)]
@@ -258,7 +265,7 @@ impl PayKit {
     }
 
     /// The underlying x402 `batch-settlement` handler, when a fee-payer signer is
-    /// configured. Drive `settle_batch` / `distribute` on it out of band.
+    /// configured. Drive `claim` / `settle` and close lifecycle work out of band.
     pub fn x402_batch(&self) -> Option<&Arc<X402BatchSettlement>> {
         self.x402_batch.as_ref()
     }
@@ -848,10 +855,27 @@ where
     ))
 }
 
-/// Build the 402 response advertising the x402 `batch-settlement` challenge, or
-/// a retryable `503` if it can't be built (e.g. the operator RPC is down).
-fn batch_challenge_response(batch: &X402BatchSettlement, amount: &str) -> Response {
-    let (name, value) = match batch.payment_required_header(amount) {
+/// Build the 402 advertising the x402 `batch-settlement` challenge, or a
+/// retryable `503` if it can't be built (e.g. the operator RPC is down).
+///
+/// `failure` carries the rejected payment header and its error, so a cumulative
+/// mismatch is answered with the corrective challenge the client resynchronizes
+/// from instead of a bare re-offer it would fail against again.
+async fn batch_challenge_response(
+    batch: &X402BatchSettlement,
+    amount: &str,
+    resource: Option<&str>,
+    failure: Option<(&str, crate::x402::Error)>,
+) -> Response {
+    let header = match failure {
+        Some((payment_header, error)) => {
+            batch
+                .challenge_for_failure(payment_header, amount, &error, resource)
+                .await
+        }
+        None => batch.payment_required_header(amount, resource),
+    };
+    let (name, value) = match header {
         Ok(header) => header,
         Err(e) => {
             tracing::warn!(amount = %amount, error = %e, "failed to build batch-settlement challenge");
@@ -874,9 +898,145 @@ fn batch_challenge_response(batch: &X402BatchSettlement, amount: &str) -> Respon
     resp
 }
 
-/// High-throughput gate: verify the cumulative voucher (or process a deposit /
-/// cooperative refund) and serve. On-chain settlement is deferred — the operator
-/// drives `settle_batch` / `distribute` out of band via [`PayKit::x402_batch`].
+/// The absolute URL of the routed request, for the x402 v2 `resource` field.
+///
+/// A request line usually carries only a path, so the authority comes from the
+/// forwarded scheme and `Host`. Both are client-supplied; the resource is an
+/// identifier echoed in the challenge, not a trust anchor — what a voucher
+/// authorizes is bound to the channel and the price, never to this string.
+fn resource_url(req: &Request) -> Option<String> {
+    let uri = req.uri();
+    if uri.authority().is_some() {
+        return Some(uri.to_string());
+    }
+    let host = req.headers().get(header::HOST)?.to_str().ok()?;
+    let scheme = req
+        .headers()
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("https");
+    Some(format!("{scheme}://{host}{}", uri.path_and_query()?))
+}
+
+/// Answer a request whose authorization was already charged and served.
+///
+/// The payment result is authoritative and is returned verbatim. When the
+/// original resource response was cached, restore that representation too.
+fn replayed_response(
+    batch: &X402BatchSettlement,
+    settlement: &crate::x402::batch_settlement::BatchSettlementResponse,
+    cached: Option<&crate::core::store::CachedUpstreamResponse>,
+) -> Response {
+    let mut resp = if let Some(cached) = cached {
+        let status = StatusCode::from_u16(cached.status).unwrap_or(StatusCode::OK);
+        let mut response = (status, cached.body.clone()).into_response();
+        if let Some(content_type) = &cached.content_type {
+            if let Ok(value) = HeaderValue::from_str(content_type) {
+                response.headers_mut().insert(header::CONTENT_TYPE, value);
+            }
+        }
+        for (name, value) in &cached.headers {
+            if let (Ok(name), Ok(value)) = (
+                HeaderName::from_bytes(name.as_bytes()),
+                HeaderValue::from_str(value),
+            ) {
+                response.headers_mut().append(name, value);
+            }
+        }
+        response
+    } else {
+        StatusCode::OK.into_response()
+    };
+    resp.headers_mut()
+        .insert(PAYMENT_REPLAY_HEADER, HeaderValue::from_static("true"));
+    attach_settlement_header(batch, settlement, &mut resp);
+    resp
+}
+
+/// Headers whose meaning belongs to the stored representation rather than to
+/// this particular transport hop or payment attempt.
+fn is_replayable_response_header(name: &HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "accept-ranges"
+            | "cache-control"
+            | "content-security-policy"
+            | "content-security-policy-report-only"
+            | "content-disposition"
+            | "content-encoding"
+            | "content-language"
+            | "content-location"
+            | "content-range"
+            | "cross-origin-embedder-policy"
+            | "cross-origin-opener-policy"
+            | "cross-origin-resource-policy"
+            | "etag"
+            | "expires"
+            | "last-modified"
+            | "location"
+            | "permissions-policy"
+            | "referrer-policy"
+            | "reporting-endpoints"
+            | "strict-transport-security"
+            | "vary"
+            | "x-content-type-options"
+            | "x-frame-options"
+            | "x-permitted-cross-domain-policies"
+            | "x-xss-protection"
+    )
+}
+
+/// Buffer a small, finite handler response so an authorization replay can
+/// return the same representation. Streaming and large responses pass through
+/// untouched and retain settlement-only replay semantics.
+async fn cacheable_response(
+    response: Response,
+) -> Result<(Response, Option<crate::core::store::CachedUpstreamResponse>), axum::Error> {
+    let size = response.body().size_hint();
+    if size
+        .upper()
+        .is_none_or(|upper| upper > MAX_CACHED_RESPONSE_BYTES)
+    {
+        return Ok((response, None));
+    }
+
+    let (parts, body) = response.into_parts();
+    let bytes = to_bytes(body, MAX_CACHED_RESPONSE_BYTES as usize).await?;
+    let content_type = parts
+        .headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned);
+    let headers = parts
+        .headers
+        .iter()
+        .filter(|(name, _)| is_replayable_response_header(name))
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_owned(), value.to_owned()))
+        })
+        .collect();
+    let cached = crate::core::store::CachedUpstreamResponse {
+        status: parts.status.as_u16(),
+        content_type,
+        headers,
+        body: bytes.to_vec(),
+    };
+    Ok((Response::from_parts(parts, Body::from(bytes)), Some(cached)))
+}
+
+/// High-throughput gate for x402 `batch-settlement`, under the scheme's
+/// `authorization` payment flow.
+///
+/// The authorization is reserved durably before the handler runs, and charged
+/// only after it succeeds — so a failed handler leaves the client uncharged and
+/// free to retry the same voucher, a successful one is charged exactly once,
+/// and a crash in between can only finish the charge, never re-serve.
+///
+/// Onchain redemption is deferred: drive `claim` / `settle` out of band via
+/// [`PayKit::x402_batch`].
 async fn batch_gate_middleware(
     State(state): State<GateState>,
     mut req: Request,
@@ -905,45 +1065,235 @@ async fn batch_gate_middleware(
         .get(PAYMENT_SIGNATURE_HEADER)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
+    let resource = resource_url(&req);
     let Some(header_value) = x402_header else {
-        return batch_challenge_response(&batch, &amount);
+        return batch_challenge_response(&batch, &amount, resource.as_deref(), None).await;
     };
 
-    let outcome = match batch.verify_payment(&header_value, &amount).await {
-        Ok(outcome) => outcome,
+    let access = match batch
+        .verify_and_reserve_payment(&header_value, &amount)
+        .await
+    {
+        Ok(access) => access,
         Err(e) => {
             tracing::warn!(amount = %amount, error = %e, "batch-settlement verification failed");
-            return batch_challenge_response(&batch, &amount);
+            // A cumulative mismatch comes back as a corrective 402 carrying the
+            // server's snapshot, so the client can resynchronize and retry.
+            return batch_challenge_response(
+                &batch,
+                &amount,
+                resource.as_deref(),
+                Some((&header_value, e)),
+            )
+            .await;
         }
     };
 
-    let settlement_header = batch.settlement_header(&outcome.response).ok();
-    let mut resp = if outcome.serve {
-        req.extensions_mut().insert(Payment {
-            amount: amount.clone(),
-            protocol: Protocol::X402,
-            reference: outcome
-                .response
-                .channel_state
-                .as_ref()
-                .map(|c| c.channel_id.clone())
-                .unwrap_or_default(),
-        });
-        next.run(req).await
-    } else {
-        // A cooperative refund is a payment-control operation, not a paid
-        // request — acknowledge it without invoking the protected handler.
-        (StatusCode::OK, "channel closed").into_response()
+    let outcome = match access {
+        // Already charged and served. The client lost the response, not the
+        // payment, so it gets the original result — never a second charge and
+        // never a second execution.
+        BatchAccess::Replay(settlement, cached) => {
+            return replayed_response(&batch, &settlement, cached.as_ref());
+        }
+
+        // Another in-flight request owns this authorization. The retryable
+        // scheme code is the body so a client can act on it without parsing
+        // prose.
+        BatchAccess::InProgress => {
+            let mut resp = (
+                StatusCode::CONFLICT,
+                crate::x402::batch_settlement::errors::DUPLICATE_SETTLEMENT,
+            )
+                .into_response();
+            resp.headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+            return resp;
+        }
+
+        // An earlier attempt's handler already succeeded; only its charge is
+        // unfinished. Finishing it is the one safe continuation.
+        BatchAccess::Resume(outcome) => {
+            return match batch.finish_commit(&outcome).await {
+                Ok(settlement) => replayed_response(&batch, &settlement, None),
+                Err(e) => {
+                    tracing::error!(error = %e, "batch-settlement commit could not be resumed");
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        "payment authorization could not be committed",
+                    )
+                        .into_response()
+                }
+            };
+        }
+
+        // A refund is a payment-control operation, not a paid request: the
+        // application handler is bypassed entirely.
+        BatchAccess::Control(outcome) => {
+            return match batch.settle_payment(outcome).await {
+                Ok(settlement) => {
+                    let mut resp = (StatusCode::OK, "channel close initiated").into_response();
+                    attach_settlement_header(&batch, &settlement, &mut resp);
+                    resp
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "batch-settlement refund failed");
+                    (StatusCode::BAD_GATEWAY, "channel close failed").into_response()
+                }
+            };
+        }
+
+        BatchAccess::Serve(outcome) => outcome,
     };
-    if let Some((name, value)) = settlement_header {
-        if let (Ok(n), Ok(v)) = (
-            HeaderName::from_bytes(name.as_bytes()),
-            HeaderValue::from_str(&value),
-        ) {
-            resp.headers_mut().insert(n, v);
+
+    let channel_id = outcome.channel_id.clone();
+    req.extensions_mut().insert(Payment {
+        amount: amount.clone(),
+        protocol: Protocol::X402,
+        reference: channel_id.clone(),
+    });
+    let resp = next.run(req).await;
+
+    // A handler that failed charges nothing: release the authorization so the
+    // same voucher can be presented again.
+    if !resp.status().is_success() {
+        if let Err(e) = batch.release_authorization(outcome).await {
+            tracing::error!(
+                channel = %channel_id,
+                error = %e,
+                "batch-settlement authorization could not be released after a failed handler"
+            );
+            // The reservation stands, and an unreleased one is never taken
+            // over — serving another request on it would run the handler
+            // twice. The client is uncharged but this voucher is spent.
+            return (
+                StatusCode::BAD_GATEWAY,
+                "payment authorization could not be released; this voucher cannot be reused",
+            )
+                .into_response();
+        }
+        return resp;
+    }
+
+    let (mut resp, cached) = match cacheable_response(resp).await {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::warn!(channel = %channel_id, error = %error, "could not buffer handler response for replay");
+            (
+                (StatusCode::BAD_GATEWAY, "resource response body failed").into_response(),
+                None,
+            )
+        }
+    };
+
+    // The crash boundary: past this point a retry may only finish the charge.
+    //
+    // A marker that fails to write is not a reason to abandon the charge. This
+    // process watched the handler succeed; the marker only makes that durable
+    // for a crash, and committing needs the reservation, not the marker. So a
+    // failure here is logged and the charge is attempted anyway — otherwise a
+    // store hiccup would serve the request for free and leave the client's
+    // channel stuck at a watermark nothing can advance.
+    if let Err(e) = batch.mark_handler_succeeded(&outcome).await {
+        tracing::error!(
+            channel = %channel_id,
+            error = %e,
+            "batch-settlement could not record a served handler; charging anyway"
+        );
+    }
+
+    match commit_served_request(&batch, &outcome, &channel_id).await {
+        Ok(settlement) => {
+            if let Some(cached) = cached {
+                if let Err(error) = batch.cache_response(&outcome, cached).await {
+                    tracing::warn!(
+                        channel = %channel_id,
+                        error = %error,
+                        "batch-settlement response cache write failed"
+                    );
+                }
+            }
+            attach_settlement_header(&batch, &settlement, &mut resp);
+            resp
+        }
+        Err(e) => {
+            // The handler already ran, so the client must not be told this
+            // succeeded: a retry finishes the charge without re-serving.
+            tracing::error!(
+                channel = %channel_id,
+                error = %e,
+                "batch-settlement commit failed after the resource was served"
+            );
+            (
+                StatusCode::BAD_GATEWAY,
+                "payment authorization could not be committed; retry the same voucher",
+            )
+                .into_response()
         }
     }
-    resp
+}
+
+/// Attempts a served request's charge is willing to make before giving up.
+const COMMIT_ATTEMPTS: u32 = 3;
+
+/// Charge a request whose handler has already run, retrying a store that is
+/// only briefly unavailable.
+///
+/// This is the last write standing between a served request and the payment
+/// for it, and it is idempotent: committing an authorization that is already
+/// committed leaves it alone, and a deposit's setup transaction is recovered
+/// by its signature rather than broadcast again. So a store that blinks costs
+/// a little latency instead of the charge.
+///
+/// What no number of attempts can cover is a store that stays unavailable, or
+/// a process that exits mid-charge. Nothing durable can be written then, and
+/// the authorization stays unreported — which a later retry treats as
+/// terminal rather than serving it a second time. That direction is
+/// deliberate: the scheme requires that one authorization never runs the
+/// handler twice, so an outage costs the operator a served request rather
+/// than costing the payer a duplicate execution.
+async fn commit_served_request(
+    batch: &X402BatchSettlement,
+    outcome: &crate::x402::server::BatchOutcome,
+    channel_id: &str,
+) -> Result<crate::x402::batch_settlement::BatchSettlementResponse, crate::x402::Error> {
+    let mut last = None;
+    for attempt in 1..=COMMIT_ATTEMPTS {
+        match batch.finish_commit(outcome).await {
+            Ok(settlement) => return Ok(settlement),
+            Err(error) => {
+                tracing::warn!(
+                    channel = %channel_id,
+                    attempt,
+                    error = %error,
+                    "batch-settlement charge failed; retrying"
+                );
+                last = Some(error);
+                if attempt < COMMIT_ATTEMPTS {
+                    tokio::time::sleep(std::time::Duration::from_millis(100 * u64::from(attempt)))
+                        .await;
+                }
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| crate::x402::Error::Other("commit did not run".into())))
+}
+
+/// Attach the `PAYMENT-RESPONSE` settlement header to `resp`.
+fn attach_settlement_header(
+    batch: &X402BatchSettlement,
+    response: &crate::x402::batch_settlement::BatchSettlementResponse,
+    resp: &mut Response,
+) {
+    let Ok((name, value)) = batch.settlement_header(response) else {
+        return;
+    };
+    if let (Ok(n), Ok(v)) = (
+        HeaderName::from_bytes(name.as_bytes()),
+        HeaderValue::from_str(&value),
+    ) {
+        resp.headers_mut().insert(n, v);
+    }
 }
 
 /// Gate a `GET` handler behind x402 `batch-settlement` at the per-request
@@ -1201,5 +1551,63 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn batch_response_cache_keeps_representation_headers_only() {
+        let mut response = (StatusCode::TEMPORARY_REDIRECT, "moved").into_response();
+        response
+            .headers_mut()
+            .insert(header::LOCATION, HeaderValue::from_static("/destination"));
+        response.headers_mut().insert(
+            header::CONTENT_DISPOSITION,
+            HeaderValue::from_static("attachment; filename=report.txt"),
+        );
+        response.headers_mut().insert(
+            HeaderName::from_static("content-security-policy"),
+            HeaderValue::from_static("default-src 'none'"),
+        );
+        response.headers_mut().insert(
+            HeaderName::from_static("x-content-type-options"),
+            HeaderValue::from_static("nosniff"),
+        );
+        response.headers_mut().insert(
+            HeaderName::from_static("x-frame-options"),
+            HeaderValue::from_static("DENY"),
+        );
+        response
+            .headers_mut()
+            .insert(header::CONNECTION, HeaderValue::from_static("close"));
+        response.headers_mut().insert(
+            HeaderName::from_static("payment-response"),
+            HeaderValue::from_static("attempt-specific"),
+        );
+
+        let (_, cached) = cacheable_response(response).await.unwrap();
+        let cached = cached.expect("small finite response is cached");
+        assert_eq!(cached.status, StatusCode::TEMPORARY_REDIRECT.as_u16());
+        assert!(cached
+            .headers
+            .contains(&("location".to_string(), "/destination".to_string())));
+        assert!(cached.headers.contains(&(
+            "content-disposition".to_string(),
+            "attachment; filename=report.txt".to_string()
+        )));
+        assert!(cached.headers.contains(&(
+            "content-security-policy".to_string(),
+            "default-src 'none'".to_string()
+        )));
+        assert!(cached
+            .headers
+            .contains(&("x-content-type-options".to_string(), "nosniff".to_string())));
+        assert!(cached
+            .headers
+            .contains(&("x-frame-options".to_string(), "DENY".to_string())));
+        assert!(!cached.headers.iter().any(|(name, _)| name == "connection"));
+        assert!(!cached
+            .headers
+            .iter()
+            .any(|(name, _)| name == "payment-response"));
+        assert_eq!(cached.body, b"moved");
     }
 }

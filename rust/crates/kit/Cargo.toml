@@ -1,6 +1,6 @@
 [package]
 name = "solana-pay-kit"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 description = "Building blocks for Agentic payments (x402, MPP, AP2)"
 license = "MIT"
@@ -92,6 +92,7 @@ solana-rpc-client = { version = "4", default-features = false }
 # (whose response context carries the slot embedded as `recentSlot`). Always
 # on — it is already a transitive dep of solana-rpc-client.
 solana-rpc-client-api = { version = "4", default-features = false }
+solana-account-decoder-client-types = { version = "4", default-features = false }
 solana-signature = { version = "3.1", default-features = false, features = ["default", "verify"] }
 solana-system-interface = { version = "2.0", default-features = false }
 solana-transaction = { version = "3", default-features = false }
@@ -100,6 +101,9 @@ solana-transaction = { version = "3", default-features = false }
 solana-transaction-status-client-types = { version = "4", default-features = false }
 solana-zero-copy = { version = "1", default-features = false }
 solana-address = { version = "2", features = ["borsh", "curve25519"] }
+
+# Sharded concurrent map for the in-memory channel store hot path.
+dashmap = "5"
 
 # Generated program-client deps (payment-channels + subscriptions).
 num-derive = "0.4"
@@ -138,6 +142,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_json_canonicalizer = "0.3"
 bs58 = "0.5"
+five8 = "1.0"
 base64 = "0.22"
 bincode = "1"
 borsh = { version = "1.0", features = ["derive"] }
@@ -147,7 +152,12 @@ getrandom = "0.3"
 # Crypto (HMAC challenge IDs + SHA-256 distribution hash + voucher verification)
 hmac = "0.12"
 sha2 = "0.10"
-ed25519-dalek = { version = "2", default-features = false, features = ["alloc"] }
+ed25519-dalek = { version = "2", default-features = false, features = ["alloc", "batch"] }
+# Direct dep only to pre-filter degenerate (small-order R) batch-verify inputs
+# the same way ed25519-dalek's own `verify_strict` does internally; version
+# must track whatever ed25519-dalek 2.x pins so the same curve point type
+# flows through both without a second copy of the crate.
+curve25519-dalek = { version = "4", default-features = false }
 
 # Time (expiration, timestamps)
 time = { version = "0.3", features = ["formatting", "parsing"] }
