@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import pytest
+
 from solana_pay_kit.protocols.mpp.core.expires import days, hours, minutes, seconds, weeks
 
 
@@ -130,3 +132,37 @@ class TestStrictRFC3339:
         # Lexically valid RFC 3339 shape, but month 13 fails the calendar
         # check delegated to datetime.fromisoformat.
         assert self._make_challenge("2099-13-01T00:00:00Z").is_expired() is True
+
+    def _parse(self, value: str) -> datetime:
+        from solana_pay_kit.protocols.mpp.core.types import _parse_rfc3339
+
+        return _parse_rfc3339(value)
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "1990-12-31T23:59:60Z",
+            "1990-12-31T15:59:60-08:00",
+            "1998-12-31T23:59:60Z",
+            "1998-12-31T15:59:60.123-08:00",
+            "1999-01-01T00:59:60+01:00",
+            "1972-06-30T23:59:60Z",
+        ],
+    )
+    def test_leap_second_at_utc_month_end_accepted(self, value):
+        parsed = self._parse(value).astimezone(UTC)
+        assert (parsed.hour, parsed.minute, parsed.second) == (23, 59, 59)
+
+    @pytest.mark.parametrize("value", ["1998-12-31T23:58:60Z", "2026-06-15T12:30:60Z"])
+    def test_leap_second_away_from_a_utc_month_end_rejected(self, value):
+        with pytest.raises(ValueError):
+            self._parse(value)
+
+    @pytest.mark.parametrize("value", ["1990-12-31T10:00:00+10:60", "2026-01-29T12:00:00+00:60"])
+    def test_offset_minute_out_of_range_rejected(self, value):
+        with pytest.raises(ValueError):
+            self._parse(value)
+
+    def test_year_0000_rejected(self):
+        with pytest.raises(ValueError):
+            self._parse("0000-01-01T00:00:00Z")
