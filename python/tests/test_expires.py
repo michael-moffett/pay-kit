@@ -158,6 +158,11 @@ class TestStrictRFC3339:
         with pytest.raises(ValueError):
             self._parse(value)
 
+    @pytest.mark.parametrize("value", ["0001-01-01T00:59:60+01:00", "9999-12-31T23:59:60-00:01"])
+    def test_leap_second_spilling_past_datetime_range_rejected(self, value):
+        with pytest.raises(ValueError):
+            self._parse(value)
+
     @pytest.mark.parametrize(
         "value",
         ["1990-12-31T10:00:00+10:60", "2026-01-29T12:00:00+00:60", "2026-01-29T12:00:00+24:00"],

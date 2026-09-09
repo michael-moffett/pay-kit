@@ -53,7 +53,10 @@ def _parse_rfc3339(value: str) -> datetime:
     parsed = datetime.fromisoformat(normalized)
     if leap_second:
         # RFC 3339 §5.7: a leap second only ever ends a UTC month.
-        utc = parsed.astimezone(UTC)
+        try:
+            utc = parsed.astimezone(UTC)
+        except OverflowError as exc:
+            raise ValueError(f"leap second not representable in UTC: {value!r}") from exc
         if (utc.hour, utc.minute) != (23, 59) or utc.day != calendar.monthrange(utc.year, utc.month)[1]:
             raise ValueError(f"leap second not at a UTC month end: {value!r}")
     return parsed
