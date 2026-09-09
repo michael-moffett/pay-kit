@@ -31,6 +31,8 @@ def _parse_rfc3339(value: str) -> datetime:
 
     Raises :class:`ValueError` on anything looser than RFC 3339 (e.g. a space
     instead of ``T``, a missing offset, or an invalid month/day combination).
+    Accepts ``23:59:60`` at a UTC month end, which §5.7 requires rather than
+    permits, and clamps it to ``23:59:59.999999``.
     Mirrors the F6 lock that landed on Ruby + PHP + Lua in PR #99 / #102.
     """
     match = _RFC3339_RE.match(value)
@@ -50,7 +52,7 @@ def _parse_rfc3339(value: str) -> datetime:
         normalized = normalized[: match.start(6)] + "59.999999" + normalized[secfrac_end:]
     parsed = datetime.fromisoformat(normalized)
     if leap_second:
-        # RFC 3339 §5.8: a leap second only ever ends a UTC month.
+        # RFC 3339 §5.7: a leap second only ever ends a UTC month.
         utc = parsed.astimezone(UTC)
         if (utc.hour, utc.minute) != (23, 59) or utc.day != calendar.monthrange(utc.year, utc.month)[1]:
             raise ValueError(f"leap second not at a UTC month end: {value!r}")
