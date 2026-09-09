@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import calendar
 import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -35,13 +36,25 @@ def _parse_rfc3339(value: str) -> datetime:
     match = _RFC3339_RE.match(value)
     if match is None:
         raise ValueError(f"not a valid RFC 3339 timestamp: {value!r}")
+    if match.group(8) is not None and (int(match.group(9)) > 23 or int(match.group(10)) > 59):
+        raise ValueError(f"offset out of range: {value!r}")
     # Delegate the calendar arithmetic to datetime.fromisoformat after we have
     # confirmed the lexical grammar. Normalize the case of the T/Z markers so
     # fromisoformat (Python 3.11+) accepts the value.
     normalized = value.replace("t", "T").replace("z", "Z")
     if normalized.endswith("Z"):
         normalized = normalized[:-1] + "+00:00"
-    return datetime.fromisoformat(normalized)
+    leap_second = match.group(6) == "60"
+    if leap_second:
+        secfrac_end = match.end(7) if match.group(7) else match.end(6)
+        normalized = normalized[: match.start(6)] + "59.999999" + normalized[secfrac_end:]
+    parsed = datetime.fromisoformat(normalized)
+    if leap_second:
+        # RFC 3339 §5.8: a leap second only ever ends a UTC month.
+        utc = parsed.astimezone(UTC)
+        if (utc.hour, utc.minute) != (23, 59) or utc.day != calendar.monthrange(utc.year, utc.month)[1]:
+            raise ValueError(f"leap second not at a UTC month end: {value!r}")
+    return parsed
 
 
 @dataclass
