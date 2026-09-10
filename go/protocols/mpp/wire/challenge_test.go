@@ -75,6 +75,8 @@ func TestIsExpiredRFC3339Corpus(t *testing.T) {
 		{"rfc_5_8_example_leap_second_z", "1990-12-31T23:59:60Z", true},
 		{"secfrac_comma_separator", "2021-09-29T16:04:33,5Z", false},
 		{"leap_second_not_at_utc_month_end", "1998-12-31T23:58:60Z", false},
+		{"leap_second_not_on_utc_month_last_day", "1998-12-30T23:59:60Z", false},
+		{"leap_second_not_in_utc_hour_23", "1998-12-31T22:59:60Z", false},
 		{"day_out_of_range", "2026-02-30T00:00:00Z", false},
 	}
 	for _, tc := range tests {
