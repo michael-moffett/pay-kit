@@ -89,6 +89,35 @@ func TestIsExpiredRFC3339Corpus(t *testing.T) {
 	}
 }
 
+// The leap second maps to the last nanosecond of :59, not the start of it, so
+// the challenge is still live at .999999998 and dead from .999999999 on
+// (IsExpired is inclusive at equality). One nanosecond either way pins it.
+func TestIsExpiredLeapSecondBoundary(t *testing.T) {
+	request, _ := NewBase64URLJSONValue(map[string]string{"amount": "1"})
+	mapped := time.Date(1990, 12, 31, 23, 59, 59, 999999999, time.UTC)
+	tests := []struct {
+		name    string
+		expires string
+		now     time.Time
+		expired bool
+	}{
+		{"z_one_ns_before_mapped", "1990-12-31T23:59:60Z", mapped.Add(-time.Nanosecond), false},
+		{"z_at_mapped", "1990-12-31T23:59:60Z", mapped, true},
+		{"z_one_ns_after_mapped", "1990-12-31T23:59:60Z", mapped.Add(time.Nanosecond), true},
+		{"offset_one_ns_before_mapped", "1990-12-31T15:59:60-08:00", mapped.Add(-time.Nanosecond), false},
+		{"offset_at_mapped", "1990-12-31T15:59:60-08:00", mapped, true},
+		{"offset_one_ns_after_mapped", "1990-12-31T15:59:60-08:00", mapped.Add(time.Nanosecond), true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			challenge := NewChallengeWithSecretFull("s", "r", NewMethodName("solana"), NewIntentName("charge"), request, tc.expires, "", "", nil)
+			if expired := challenge.IsExpired(tc.now); expired != tc.expired {
+				t.Fatalf("IsExpired(%q) at %s = %v, want %v", tc.expires, tc.now.Format(time.RFC3339Nano), expired, tc.expired)
+			}
+		})
+	}
+}
+
 func TestIsExpiredInvalidTimestamp(t *testing.T) {
 	request, _ := NewBase64URLJSONValue(map[string]string{"amount": "1"})
 	challenge := NewChallengeWithSecretFull("s", "r", NewMethodName("solana"), NewIntentName("charge"), request, "not-a-date", "", "", nil)
