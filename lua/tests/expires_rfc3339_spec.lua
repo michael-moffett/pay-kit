@@ -59,10 +59,7 @@ t.test('expires.is_expired returns true on unparseable input', function()
   t.assert_equal(expires.is_expired('not-a-timestamp', 0), true)
 end)
 
--- solana-foundation/pay-kit#284, the Lua rows: 13 RC-3 (`time-secfrac` is
--- `"." 1*DIGIT` with no upper bound, RFC 3339 sec 5.6) and 3 RC-2 (`:60` is a
--- positive leap second only at 23:59:60 UTC on a month's last day, sec 5.7).
--- One test per checkbox row, named for the vector.
+-- The Lua rows on issue #284: 13 RC-3 (secfrac digit cap) and 3 RC-2 (:60 off a leap-second instant), one test per row.
 
 local RC3_ACCEPT = {
   { 'go_longfrac_10digits_0000000000', '2021-09-29T16:04:33.0000000000Z' },
@@ -103,7 +100,6 @@ for _, row in ipairs(RC2_REJECT) do
 end
 
 t.test('#284 the leap seconds the corpus accepts still parse', function()
-  -- Not Lua divergences; pinned so the RC-2 rule cannot over-reject.
   local expires = require('pay_kit.protocols.mpp.expires')
   for _, value in ipairs({
     '1998-12-31T23:59:60Z', '1998-12-31T15:59:60.123-08:00', '1972-06-30T23:59:60Z',
@@ -111,4 +107,10 @@ t.test('#284 the leap seconds the corpus accepts still parse', function()
   }) do
     t.assert_true(expires.parse_rfc3339(value) ~= nil, value)
   end
+end)
+
+t.test('#284 RC-2 an offset that rolls the UTC day forward off the month end rejects', function()
+  -- 1998-12-31T23:59:60-08:00 is 1999-01-01T07:59:60Z, not a leap-second instant.
+  local expires = require('pay_kit.protocols.mpp.expires')
+  t.assert_true(expires.parse_rfc3339('1998-12-31T23:59:60-08:00') == nil)
 end)
