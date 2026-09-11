@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace PayKit\PayCore;
 
 use DateTimeImmutable;
+use DateTimeZone;
 
 /**
  * RFC 3339 date-time parser used by Challenge::isExpired().
@@ -21,9 +22,9 @@ final class Rfc3339Parser
     /**
      * Strict RFC 3339 date-time grammar (sec 5.6); accepts lowercase t/z on
      * parse (RFC 3339 sec 5.6 PARSE caveat), year exactly 4 digits,
-     * fractional seconds 1..9 digits.
+     * fractional seconds 1 or more digits (time-secfrac = 1*DIGIT).
      */
-    private const RFC3339_PATTERN = '/^(\d{4})-(\d{2})-(\d{2})[Tt](\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?(Z|z|([+-])(\d{2}):(\d{2}))$/';
+    private const RFC3339_PATTERN = '/^(\d{4})-(\d{2})-(\d{2})[Tt](\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?(Z|z|([+-])(\d{2}):(\d{2}))$/';
 
     private function __construct()
     {
@@ -53,7 +54,8 @@ final class Rfc3339Parser
         if ($month < 1 || $month > 12 || $day < 1 || $day > 31 || $hour > 23 || $minute > 59 || $second > 60) {
             return null;
         }
-        if ($year > 9999 || !checkdate($month, $day, $year)) {
+        // year 0000 is a leap year (date-fullyear = 4DIGIT); checkdate() rejects it, so validate against leap-year 4.
+        if ($year > 9999 || !checkdate($month, $day, $year === 0 ? 4 : $year)) {
             return null;
         }
         if ($offsetTag !== 'Z' && $offsetTag !== 'z') {
@@ -84,7 +86,7 @@ final class Rfc3339Parser
         $frac = $m[7];
         if ($frac !== '') {
             $truncated = substr($frac, 0, 6);
-            $normalized = preg_replace('/\.\d{1,9}/', '.' . $truncated, $normalized, 1) ?? $normalized;
+            $normalized = preg_replace('/\.\d+/', '.' . $truncated, $normalized, 1) ?? $normalized;
         }
         $parsed = DateTimeImmutable::createFromFormat(DATE_ATOM, $normalized);
         if ($parsed === false) {
@@ -95,6 +97,12 @@ final class Rfc3339Parser
         }
         if ($parsed === false) {
             return null;
+        }
+        if ($second === 60) {
+            $utc = $parsed->setTimezone(new DateTimeZone('UTC'));
+            if ($utc->format('H') !== '23' || $utc->format('i') !== '59' || $utc->format('j') !== $utc->format('t')) {
+                return null;
+            }
         }
         return $parsed;
     }
