@@ -67,10 +67,7 @@ final class Rfc3339Parser
         }
 
         // Normalize lowercase t/z to uppercase before delegating to DateTimeImmutable (DATE_ATOM is strict).
-        // PHP's `u` format only accepts exactly six fractional digits; RFC 3339 permits 1..9.
-        // Truncate the regex-captured fractional component to microseconds (the regex already
-        // bounded it to 1..9 digits, so truncation is safe). Sub-microsecond precision is dropped
-        // for expiry comparison purposes which is acceptable since we only need second-level resolution.
+        // PHP's `u` format takes at most six fractional digits; RFC 3339 sets no cap, so truncate to microseconds.
         $normalized = strtr($value, ['t' => 'T', 'z' => 'Z']);
         // RFC 3339 §5.7 leap second normalization. The range guard above
         // accepts sec=60 for spec parity with Lua/Go/Ruby, but PHP's
