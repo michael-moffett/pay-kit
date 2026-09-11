@@ -8,9 +8,7 @@ module PayCore
   #
   # @see https://datatracker.ietf.org/doc/html/rfc3339 RFC 3339 Date and Time on the Internet
   module Rfc3339Parser
-    # Strict RFC 3339 date-time (sec 5.6). Year is exactly 4 digits; T literal
-    # accepted upper or lower (per parse SHOULD); time-secfrac is "." 1*DIGIT,
-    # so the digit count is unbounded here and truncated after the match.
+    # Strict RFC 3339 date-time (sec 5.6); secfrac digits unbounded, truncated after the match.
     REGEX = /\A
       (\d{4})-(\d{2})-(\d{2})         # full-date
       [Tt]
@@ -36,17 +34,12 @@ module PayCore
       return nil if month < 1 || month > 12
       return nil if day < 1 || day > 31
       return nil if hour > 23 || minute > 59 || second > 60
-      # time-numoffset bounds the offset at 23:59, but Time.iso8601 reads
-      # +00:60 as +01:00 — a silent hour shift in the instant an expiry is
-      # compared against, so the offset is ranged before it is delegated.
       return nil if match[8] && (match[8].delete("+-").to_i > 23 || match[9].to_i > 59)
       return nil if year > 9999
       return nil unless Date.valid_date?(year, month, day)
 
-      # Rebuilt from the captures rather than delegated verbatim: Time.iso8601
-      # rejects the lowercase t/z that sec 5.6 allows, keeps sub-nanosecond
-      # secfrac as a Rational no other SDK can carry, and rolls seconds = 60
-      # forward into the next minute instead of clamping it.
+      # Time.iso8601 rejects lowercase t/z, reads +00:60 as +01:00 and rolls :60
+      # into the next minute, so the input is ranged and rebuilt before delegating.
       leap_second = second == 60
       secfrac = match[7] ? ".#{match[7][0, 9]}" : ""
       secfrac = ".999999999" if leap_second
@@ -55,8 +48,6 @@ module PayCore
                             "#{leap_second ? "59" : match[6]}#{secfrac}#{offset}")
       return parsed unless leap_second
 
-      # RFC 3339 sec 5.7: a leap second only ever ends a UTC month, and the
-      # offset is applied before that is judged. Matches the TypeScript SDK.
       utc = parsed.getutc
       return nil unless utc.hour == 23 && utc.min == 59 && utc.day == Date.new(utc.year, utc.month, -1).day
 

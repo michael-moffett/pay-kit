@@ -57,11 +57,8 @@ class ExpiresRfc3339Test < Minitest::Test
     refute_nil parser.parse("2099-01-01T00:00:00-08:00") # negative offset
   end
 
-  # The 18 rows #284 lists as Ruby-divergent, keyed by the shared corpus's own
-  # vector names so a row here greps to a row there.
+  # The 18 vectors #284 lists as Ruby-divergent, keyed by corpus name.
   RFC3339_CORPUS = [
-    # time-secfrac is "." 1*DIGIT, so any digit count parses; digits past
-    # nanosecond precision are dropped and never decide the verdict.
     ["go_longfrac_10digits_0000000000", "2021-09-29T16:04:33.0000000000Z", true],
     ["go_longfrac_10digits_0000000001", "2021-09-29T16:04:33.0000000001Z", true],
     ["go_longfrac_10digits_0123456789", "2021-09-29T16:04:33.0123456789Z", true],
@@ -75,13 +72,9 @@ class ExpiresRfc3339Test < Minitest::Test
     ["jsts_date_time_026", "1985-04-12T00:59:59.999999999999999Z", true],
     ["secfrac_10_digits", "2026-01-29T12:00:00.1234567890Z", true],
     ["secfrac_19_digits_exceeds_int64", "2026-01-29T12:00:00.9999999999999999999Z", true],
-    # The offset applies first: seconds = 60 survives only where the instant is
-    # 23:59:60 UTC on the last day of a UTC month.
     ["jsts_date_time_008", "1998-12-31T23:58:60Z", false],
     ["jsts_date_time_009", "1998-12-31T22:59:60Z", false],
     ["leap_second_offset_rolls_local_date_forward_wrong_offset", "1999-01-01T00:59:60+02:00", false],
-    # time-numoffset bounds the offset at 23:59; Time.iso8601 silently reads
-    # +00:60 as +01:00, which shifts the instant an expiry is compared against.
     ["jsts_date_time_015", "1990-12-31T10:00:00+10:60", false],
     ["offset_minute_out_of_range", "2026-01-29T12:00:00+00:60", false]
   ].freeze
@@ -100,13 +93,10 @@ class ExpiresRfc3339Test < Minitest::Test
   def test_rfc3339_parser_leap_second_maps_to_the_last_instant_of_59
     parser = ::PayCore::Rfc3339Parser
     mapped = Time.utc(1998, 12, 31, 23, 59, 59, Rational(999_999_999, 1000))
-    # Both spellings of the same UTC month-end leap second, so the offset form
-    # is pinned as accepted and not merely as "not rejected by the clamp".
     assert_equal mapped, parser.parse("1998-12-31T23:59:60Z")
     assert_equal mapped, parser.parse("1999-01-01T00:59:60+01:00")
     assert_nil parser.parse("1998-12-30T23:59:60Z"), "leap second off the UTC month end"
-    # Truncation, not rounding: rounding would carry into the next second.
-    assert_equal Rational(999_999_999, 1_000_000_000), parser.parse("2021-09-29T16:04:33.9999999999Z").subsec
+    assert_equal Rational(999_999_999, 1_000_000_000), parser.parse("2021-09-29T16:04:33.9999999999Z").subsec, "truncated, not rounded"
   end
 
   def test_expires_strict_rfc3339_branches
