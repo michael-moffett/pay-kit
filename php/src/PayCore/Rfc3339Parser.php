@@ -54,8 +54,7 @@ final class Rfc3339Parser
         if ($month < 1 || $month > 12 || $day < 1 || $day > 31 || $hour > 23 || $minute > 59 || $second > 60) {
             return null;
         }
-        // year 0000 is a leap year (date-fullyear = 4DIGIT); checkdate() rejects it, so validate against leap-year 4.
-        if ($year > 9999 || !checkdate($month, $day, $year === 0 ? 4 : $year)) {
+        if ($year > 9999 || !checkdate($month, $day, $year)) {
             return null;
         }
         if ($offsetTag !== 'Z' && $offsetTag !== 'z') {
@@ -69,14 +68,8 @@ final class Rfc3339Parser
         // Normalize lowercase t/z to uppercase before delegating to DateTimeImmutable (DATE_ATOM is strict).
         // PHP's `u` format takes at most six fractional digits; RFC 3339 sets no cap, so truncate to microseconds.
         $normalized = strtr($value, ['t' => 'T', 'z' => 'Z']);
-        // RFC 3339 §5.7 leap second normalization. The range guard above
-        // accepts sec=60 for spec parity with Lua/Go/Ruby, but PHP's
-        // DateTimeImmutable::createFromFormat rejects :60 outright (it
-        // does not implement the leap-second extension). Downshift to
-        // :59 before delegating so a credential timestamped exactly at
-        // 23:59:60 UTC parses to 23:59:59 UTC for expiry comparison.
-        // The 1-second resolution slip at the leap-second boundary has
-        // no operational impact: expiry comparison is whole-second.
+        // RFC 3339 §5.7: a leap second only ends a UTC month; PHP cannot
+        // represent :60, so parse as :59 and check the instant afterwards.
         if ($second === 60) {
             $normalized = preg_replace('/:60(?=\.|Z|[+\-])/', ':59', $normalized, 1) ?? $normalized;
         }

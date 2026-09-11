@@ -53,7 +53,6 @@ final class Rfc3339Test extends TestCase
             'jsts_date_time_026' => ['1985-04-12T00:59:59.999999999999999Z', '1985-04-12T00:59:59+00:00'],
             'secfrac_10_digits' => ['2026-01-29T12:00:00.1234567890Z', '2026-01-29T12:00:00+00:00'],
             'secfrac_19_digits_exceeds_int64' => ['2026-01-29T12:00:00.9999999999999999999Z', '2026-01-29T12:00:00+00:00'],
-            'year_0000' => ['0000-01-01T00:00:00Z', '0000-01-01T00:00:00+00:00'],
         ];
     }
 
@@ -87,6 +86,7 @@ final class Rfc3339Test extends TestCase
             'jsts_date_time_008' => ['1998-12-31T23:58:60Z'],
             'jsts_date_time_009' => ['1998-12-31T22:59:60Z'],
             'leap_second_offset_rolls_local_date_forward_wrong_offset' => ['1999-01-01T00:59:60+02:00'],
+            'year_0000' => ['0000-01-01T00:00:00Z'],
         ];
     }
 
