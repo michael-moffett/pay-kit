@@ -104,6 +104,7 @@ class ExpiresRfc3339Test < Minitest::Test
     # is pinned as accepted and not merely as "not rejected by the clamp".
     assert_equal mapped, parser.parse("1998-12-31T23:59:60Z")
     assert_equal mapped, parser.parse("1999-01-01T00:59:60+01:00")
+    assert_nil parser.parse("1998-12-30T23:59:60Z"), "leap second off the UTC month end"
     # Truncation, not rounding: rounding would carry into the next second.
     assert_equal Rational(999_999_999, 1_000_000_000), parser.parse("2021-09-29T16:04:33.9999999999Z").subsec
   end

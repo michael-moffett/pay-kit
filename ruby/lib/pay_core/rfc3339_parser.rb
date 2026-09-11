@@ -10,7 +10,7 @@ module PayCore
   module Rfc3339Parser
     # Strict RFC 3339 date-time (sec 5.6). Year is exactly 4 digits; T literal
     # accepted upper or lower (per parse SHOULD); time-secfrac is "." 1*DIGIT,
-    # so the digit count is unbounded here and clamped after the match.
+    # so the digit count is unbounded here and truncated after the match.
     REGEX = /\A
       (\d{4})-(\d{2})-(\d{2})         # full-date
       [Tt]
