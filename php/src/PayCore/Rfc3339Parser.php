@@ -66,34 +66,35 @@ final class Rfc3339Parser
         }
 
         // Normalize lowercase t/z to uppercase before delegating to DateTimeImmutable (DATE_ATOM is strict).
-        // PHP's `u` format takes at most six fractional digits; RFC 3339 sets no cap, so truncate to microseconds.
         $normalized = strtr($value, ['t' => 'T', 'z' => 'Z']);
-        // RFC 3339 §5.7: a leap second only ends a UTC month; PHP cannot
-        // represent :60, so parse as :59 and check the instant afterwards.
-        if ($second === 60) {
-            $normalized = preg_replace('/:60(?=\.|Z|[+\-])/', ':59', $normalized, 1) ?? $normalized;
-        }
         $frac = $m[7];
         if ($frac !== '') {
             $truncated = substr($frac, 0, 6);
             $normalized = preg_replace('/\.\d+/', '.' . $truncated, $normalized, 1) ?? $normalized;
         }
-        $parsed = DateTimeImmutable::createFromFormat(DATE_ATOM, $normalized);
-        if ($parsed === false) {
-            $parsed = DateTimeImmutable::createFromFormat('Y-m-d\TH:i:s.up', $normalized);
-        }
-        if ($parsed === false) {
-            $parsed = DateTimeImmutable::createFromFormat('Y-m-d\TH:i:s.uP', $normalized);
-        }
-        if ($parsed === false) {
-            return null;
-        }
+        // RFC 3339 §5.7: a leap second only ends a UTC month; PHP has no :60, so parse :59 and check the instant after.
         if ($second === 60) {
+            $parsed = self::createFromAtom(preg_replace('/:60(?=\.|Z|[+\-])/', ':59', $normalized, 1) ?? $normalized);
+            if ($parsed === null) {
+                return null;
+            }
             $utc = $parsed->setTimezone(new DateTimeZone('UTC'));
             if ($utc->format('H') !== '23' || $utc->format('i') !== '59' || $utc->format('j') !== $utc->format('t')) {
                 return null;
             }
+            return $parsed;
         }
-        return $parsed;
+        return self::createFromAtom($normalized);
+    }
+
+    private static function createFromAtom(string $normalized): ?DateTimeImmutable
+    {
+        foreach ([DATE_ATOM, 'Y-m-d\TH:i:s.up', 'Y-m-d\TH:i:s.uP'] as $format) {
+            $parsed = DateTimeImmutable::createFromFormat($format, $normalized);
+            if ($parsed !== false) {
+                return $parsed;
+            }
+        }
+        return null;
     }
 }
